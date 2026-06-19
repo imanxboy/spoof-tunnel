@@ -1,0 +1,25 @@
+# Compiled binary
+bin/spoof-tunnel
+bin/
+
+# Site-specific configs (never commit production configs)
+config.yaml
+config-*.yaml
+!config.yaml.example
+
+# Installer working directory
+dist/
+
+# Editor and OS files
+.DS_Store
+*.bak
+*.tmp
+*~
+.vscode/
+.idea/
+
+# Internal audit documents (not for public release)
+GITHUB_AUDIT.md
+GITHUB_AUDIT_V2.md
+PUBLISH_READINESS.md
+PUBLISH_READINESS_V2.md

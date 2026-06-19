@@ -1,0 +1,28 @@
+# Force LF line endings for all text files so scripts work on Linux
+* text=auto eol=lf
+
+# Shell scripts must have LF
+*.sh text eol=lf
+scripts/spoofctl text eol=lf
+install.sh text eol=lf
+healthcheck.sh text eol=lf
+status.sh text eol=lf
+update.sh text eol=lf
+uninstall.sh text eol=lf
+build.sh text eol=lf
+
+# C source
+*.c text eol=lf
+
+# Python
+*.py text eol=lf
+
+# Markdown and YAML: LF
+*.md text eol=lf
+*.yaml text eol=lf
+
+# Makefile: LF (tabs are significant)
+Makefile text eol=lf
+
+# Binaries
+bin/spoof-tunnel binary

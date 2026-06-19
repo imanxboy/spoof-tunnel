@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish release
+    # Ubuntu 22.04 → glibc 2.35; binary runs on any system with glibc >= 2.35
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc
+
+      - name: Build binary
+        run: |
+          bash build.sh
+          echo "SHA256=$(sha256sum bin/spoof-tunnel | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Verify binary links
+        run: |
+          file bin/spoof-tunnel
+          ldd  bin/spoof-tunnel
+
+      - name: Create release tarball
+        run: |
+          TAG="${{ github.ref_name }}"
+          make release RELEASE_TAG="${TAG}"
+          echo "TARBALL=dist/spoof-tunnel-${TAG}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Generate checksums file
+        run: |
+          cd dist
+          sha256sum "$(ls *.tar.gz)" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "spoof-tunnel ${{ github.ref_name }}"
+          body: |
+            ## spoof-tunnel ${{ github.ref_name }}
+
+            ### Quick install
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install.sh | sudo bash
+            ```
+
+            ### Manual install
+            1. Download `spoof-tunnel-${{ github.ref_name }}.tar.gz`
+            2. Extract and run `sudo bash install.sh`
+
+            ### Binary SHA256
+            ```
+            ${{ env.SHA256 }}  bin/spoof-tunnel
+            ```
+
+            ### Notes
+            - Built on Ubuntu 22.04 (glibc 2.35) — compatible with Ubuntu 22.04+, Debian 12+
+            - For older systems or different architectures, build from source: `make build`
+          files: |
+            dist/spoof-tunnel-${{ github.ref_name }}.tar.gz
+            dist/SHA256SUMS
+          draft: false
+          prerelease: false

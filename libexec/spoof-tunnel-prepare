@@ -1,0 +1,38 @@
+#!/bin/bash
+# spoof-tunnel-prepare — ExecStartPre hook for spoof-tunnel.service
+#
+# Runs before the tunnel process starts:
+#   1. Disables rp_filter on the outer interface and TUN (required for spoofed
+#      source IPs to pass the kernel's reverse-path filter on ingress).
+#   2. Installs an iptables DROP rule so the kernel does not send ICMP
+#      port-unreachable replies for spoofed UDP frames that AF_PACKET reads
+#      before the networking stack can deliver them to a UDP socket.
+#   3. Enables ip_forward for TUN routing between the tunnel and the overlay
+#      service (Xray, VLESS, etc.).
+#
+# Environment is loaded from /etc/spoof-tunnel/tunnel.env (written by
+# config-parse.py during install).
+set -euo pipefail
+
+source /etc/spoof-tunnel/tunnel.env
+
+# rp_filter must be 0 for spoofed source IPs to survive the kernel's ingress
+# check. Without this, inbound spoofed packets are silently dropped before
+# AF_PACKET sees them on the RX path.
+sysctl -qw "net.ipv4.conf.${IFACE}.rp_filter=0"    2>/dev/null || true
+sysctl -qw "net.ipv4.conf.${TUN_NAME}.rp_filter=0" 2>/dev/null || true
+sysctl -qw "net.ipv4.conf.all.rp_filter=0"         2>/dev/null || true
+
+# Drop incoming tunnel UDP so the kernel does not send ICMP port-unreachable
+# replies. AF_PACKET intercepts the raw frame before the kernel processes it,
+# but without this rule the kernel also tries to deliver the packet to a UDP
+# socket, fails, and generates unwanted ICMP traffic back to the peer.
+if [ "${OUTER:-udp}" = "udp" ]; then
+    if ! iptables -C INPUT -p udp --dport "${LISTEN_PORT}" -j DROP 2>/dev/null; then
+        iptables -I INPUT -p udp --dport "${LISTEN_PORT}" -j DROP
+    fi
+fi
+
+# ip_forward is required for the TUN interface to forward packets between the
+# tunnel and the overlay service.
+sysctl -qw net.ipv4.ip_forward=1

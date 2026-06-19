@@ -1,0 +1,31 @@
+#!/bin/bash
+# spoof-tunnel-qdisc — ExecStartPost hook for spoof-tunnel.service
+#
+# Installs an fq (Fair Queue) qdisc on the outer physical interface after the
+# tunnel process signals ready. fq provides per-flow pacing which reduces burst
+# losses at high packet rates (16K+ pps) by spreading bursts across the NIC
+# transmit queue. Only runs in UDP mode (TCP outer uses the kernel stack's own
+# congestion control).
+#
+# The retry loop is needed because the TUN interface assignment (which triggers
+# the NIC to be eligible for fq) may complete slightly after sd_notify fires.
+set -euo pipefail
+
+source /etc/spoof-tunnel/tunnel.env
+
+[ "${OUTER:-udp}" = "udp" ] || exit 0
+
+LIMIT=50000
+FL="${FLOW_LIMIT:-1000}"
+
+for _i in 1 2 3 4 5; do
+    if tc qdisc replace dev "${IFACE}" root fq \
+           limit "${LIMIT}" flow_limit "${FL}" 2>/dev/null; then
+        echo "spoof-tunnel-qdisc: fq applied on ${IFACE} (flow_limit=${FL})"
+        exit 0
+    fi
+    sleep 1
+done
+
+# Final attempt — let tc print its own error if it fails
+tc qdisc replace dev "${IFACE}" root fq limit "${LIMIT}" flow_limit "${FL}"

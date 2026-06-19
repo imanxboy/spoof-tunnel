@@ -1,0 +1,633 @@
+#!/bin/bash
+# spoofctl — management CLI for spoof-tunnel v6
+# Usage: spoofctl [command]
+#   Commands: status start stop restart edit-config spoof-ips forward-rules update rollback uninstall
+#   No command → interactive menu
+set -euo pipefail
+
+# ── paths ────────────────────────────────────────────────────────────────────
+
+BIN="/usr/local/bin/spoof-tunnel"
+LIB_DIR="/usr/local/lib/spoof-tunnel"
+CONF_DIR="/etc/spoof-tunnel"
+CONF_YAML="${CONF_DIR}/config.yaml"
+ENV_FILE="${CONF_DIR}/tunnel.env"
+HEALTH_JSON="/run/spoof-tunnel/health.json"
+BACKUP_DIR="/var/backups/spoof-tunnel"
+SERVICE="spoof-tunnel"
+UPDATE_CONF="${CONF_DIR}/update.conf"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+need_root() {
+    [ "$(id -u)" = "0" ] || die "This operation requires root. Re-run with sudo."
+}
+
+color_ok()   { printf '\033[0;32m%s\033[0m' "$*"; }
+color_warn() { printf '\033[0;33m%s\033[0m' "$*"; }
+color_err()  { printf '\033[0;31m%s\033[0m' "$*"; }
+
+is_installed() {
+    [ -f "$BIN" ] && [ -f "$ENV_FILE" ]
+}
+
+svc_state() {
+    systemctl is-active "${SERVICE}" 2>/dev/null || echo "inactive"
+}
+
+load_env() {
+    [ -f "$ENV_FILE" ] || return 0
+    set -a; source "$ENV_FILE"; set +a
+}
+
+hr() {
+    echo "  ─────────────────────────────────────────────────────"
+}
+
+# ── status ───────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    if ! is_installed; then
+        echo "spoof-tunnel is not installed."
+        return
+    fi
+    if [ -x "${LIB_DIR}/status.sh" ]; then
+        "${LIB_DIR}/status.sh"
+        return
+    fi
+    load_env
+    hr
+    printf "  spoof-tunnel  [%s]\n" "${MODE:-unknown}"
+    hr
+    STATE=$(svc_state)
+    if [ "$STATE" = "active" ]; then
+        printf "  Service: %s\n" "$(color_ok "$STATE")"
+    else
+        printf "  Service: %s\n" "$(color_err "$STATE")"
+    fi
+    printf "  Peer: %s:%s\n" "${PEER_IP:-?}" "${PEER_PORT:-2080}"
+    if [ -f "$HEALTH_JSON" ]; then
+        TX=$(python3 -c "import json; d=json.load(open('$HEALTH_JSON')); print(d.get('tx_pps',0))" 2>/dev/null || echo 0)
+        RX=$(python3 -c "import json; d=json.load(open('$HEALTH_JSON')); print(d.get('rx_pps',0))" 2>/dev/null || echo 0)
+        LP=$(python3 -c "import json; d=json.load(open('$HEALTH_JSON')); print(d.get('loss_pct',0))" 2>/dev/null || echo 0)
+        printf "  TX: %s pps   RX: %s pps   Loss: %s%%\n" "$TX" "$RX" "$LP"
+    fi
+    hr
+}
+
+# ── start / stop / restart ───────────────────────────────────────────────────
+
+cmd_start() {
+    need_root
+    is_installed || die "spoof-tunnel is not installed."
+    echo "Starting ${SERVICE}..."
+    systemctl start "${SERVICE}"
+    sleep 2
+    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
+        echo "$(color_ok "Service started.")"
+    else
+        echo "$(color_err "Service failed to start.")"
+        journalctl -u "${SERVICE}" -n 20 --no-pager >&2
+        exit 1
+    fi
+}
+
+cmd_stop() {
+    need_root
+    echo "Stopping ${SERVICE}..."
+    systemctl stop "${SERVICE}"
+    echo "$(color_ok "Service stopped.")"
+}
+
+cmd_restart() {
+    need_root
+    is_installed || die "spoof-tunnel is not installed."
+    echo "Restarting ${SERVICE}..."
+    systemctl restart "${SERVICE}"
+    sleep 2
+    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
+        echo "$(color_ok "Service restarted.")"
+    else
+        echo "$(color_err "Service failed to restart.")"
+        journalctl -u "${SERVICE}" -n 20 --no-pager >&2
+        exit 1
+    fi
+}
+
+# ── edit config ──────────────────────────────────────────────────────────────
+
+cmd_edit_config() {
+    need_root
+    [ -f "$CONF_YAML" ] || die "Config file not found: ${CONF_YAML}"
+    EDITOR="${EDITOR:-$(command -v nano 2>/dev/null || command -v vi 2>/dev/null || true)}"
+    [ -n "${EDITOR}" ] || die "No editor found. Install nano or vi, or set \$EDITOR."
+    "$EDITOR" "$CONF_YAML"
+    echo ""
+    read -rp "Apply changes now (regenerate tunnel.env and restart)? [y/N] " yn || true
+    case "${yn,,}" in
+        y|yes)
+            echo "Regenerating config..."
+            python3 "${LIB_DIR}/config-parse.py" \
+                --output "${ENV_FILE}" "${CONF_YAML}"
+            cmd_restart
+            ;;
+        *)
+            echo "Config saved. Restart manually with: spoofctl restart"
+            ;;
+    esac
+}
+
+# ── change spoof IPs ─────────────────────────────────────────────────────────
+
+cmd_spoof_ips() {
+    need_root
+    load_env
+    echo ""
+    echo "  Current spoof IPs: ${SPOOF_IPS:-none}"
+    echo ""
+    echo "  Enter new comma-separated list, e.g.: 1.2.3.4,5.6.7.8"
+    read -rp "  New IPs: " NEW_IPS || true
+    NEW_IPS="${NEW_IPS// /}"
+    [ -z "$NEW_IPS" ] && { echo "No change."; return; }
+
+    # Validate
+    VALID=""
+    IFS=',' read -ra _ARR <<< "$NEW_IPS"
+    for _ip in "${_ARR[@]}"; do
+        _ip="${_ip// /}"
+        [ -z "$_ip" ] && continue
+        if python3 -c "import socket, sys; socket.inet_aton(sys.argv[1])" "$_ip" 2>/dev/null; then
+            VALID="${VALID:+$VALID,}${_ip}"
+        else
+            echo "  WARNING: '$_ip' is invalid — skipping."
+        fi
+    done
+    [ -z "$VALID" ] && die "No valid IPs entered."
+
+    echo "  Setting SPOOF_IPS=${VALID}"
+
+    # Update tunnel.env
+    if grep -q '^SPOOF_IPS=' "$ENV_FILE"; then
+        sed -i "s|^SPOOF_IPS=.*|SPOOF_IPS=${VALID}|" "$ENV_FILE"
+    else
+        echo "SPOOF_IPS=${VALID}" >> "$ENV_FILE"
+    fi
+
+    # Update config.yaml addresses section
+    if [ -f "$CONF_YAML" ]; then
+        # Build replacement YAML block
+        ADDR_BLOCK=""
+        IFS=',' read -ra _ARR2 <<< "$VALID"
+        for _ip in "${_ARR2[@]}"; do
+            ADDR_BLOCK="${ADDR_BLOCK}  - ${_ip}"$'\n'
+        done
+        # Use python3 to safely rewrite the addresses list
+        python3 - "$CONF_YAML" "$VALID" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+ips  = [i.strip() for i in sys.argv[2].split(',') if i.strip()]
+with open(path) as f:
+    text = f.read()
+new_block = 'addresses:\n' + ''.join(f'  - {ip}\n' for ip in ips)
+text = re.sub(r'addresses:\s*\n(?:[ \t]*-[^\n]*\n)*', new_block, text)
+with open(path, 'w') as f:
+    f.write(text)
+print("config.yaml updated.")
+PYEOF
+    fi
+
+    echo ""
+    read -rp "  Restart service to apply? [Y/n] " yn || true
+    case "${yn,,}" in
+        n|no) echo "  Restart manually: spoofctl restart" ;;
+        *)    cmd_restart ;;
+    esac
+}
+
+# ── forward-rules ────────────────────────────────────────────────────────────
+
+cmd_forward_rules() {
+    need_root
+    load_env
+
+    if [ "${MODE:-}" = "server" ]; then
+        echo "  This node is a SERVER. Port forwarding is only used on CLIENT nodes."
+        echo "  Xray on the server accepts connections directly from the tunnel IP."
+        return
+    fi
+
+    echo ""
+    echo "  Current forwarded ports: ${FORWARD_PORTS:-none}"
+    echo "  Peer TUN IP:             ${PEER_TUN:-10.100.100.1}"
+    echo ""
+    echo "  Enter port numbers to forward (TCP+UDP both implied per port)."
+    echo "  Example: 443,80,2053"
+    echo "  Leave empty to clear all forwarding rules."
+    echo ""
+    read -rp "  Ports [${FORWARD_PORTS:-none}]: " NEW_FWD || true
+    NEW_FWD="${NEW_FWD// /}"
+
+    # Validate port numbers
+    VALID_FWD=""
+    if [ -n "$NEW_FWD" ]; then
+        IFS=',' read -ra _ARR <<< "$NEW_FWD"
+        for _p in "${_ARR[@]}"; do
+            _p="${_p// /}"
+            [ -z "$_p" ] && continue
+            if [[ "$_p" =~ ^[0-9]+$ ]] \
+               && [ "$_p" -ge 1 ] && [ "$_p" -le 65535 ]; then
+                VALID_FWD="${VALID_FWD:+$VALID_FWD,}${_p}"
+            else
+                echo "  WARNING: '${_p}' is not a valid port (1–65535) — skipping."
+            fi
+        done
+    fi
+
+    echo "  Setting FORWARD_PORTS=${VALID_FWD:-<empty>}"
+
+    # Remove old iptables rules before applying the new set
+    /usr/local/libexec/spoof-tunnel-forward --remove 2>/dev/null || true
+
+    # Update tunnel.env
+    if grep -q '^FORWARD_PORTS=' "$ENV_FILE"; then
+        sed -i "s|^FORWARD_PORTS=.*|FORWARD_PORTS=${VALID_FWD}|" "$ENV_FILE"
+    else
+        echo "FORWARD_PORTS=${VALID_FWD}" >> "$ENV_FILE"
+    fi
+
+    # Update config.yaml forwarding.ports section
+    if [ -f "$CONF_YAML" ]; then
+        python3 - "$CONF_YAML" "$VALID_FWD" << 'PYEOF'
+import sys, re
+path  = sys.argv[1]
+ports = [p.strip() for p in sys.argv[2].split(',') if p.strip()] if sys.argv[2] else []
+
+with open(path) as f:
+    text = f.read()
+
+if ports:
+    new_block = 'forwarding:\n  ports:\n'
+    for p in ports:
+        new_block += f'    - {p}\n'
+    if re.search(r'^forwarding:', text, re.M):
+        text = re.sub(r'^forwarding:.*?(?=^\S|\Z)', new_block,
+                      text, flags=re.M | re.S)
+    else:
+        text = text.rstrip('\n') + '\n\n' + new_block
+else:
+    text = re.sub(r'^forwarding:.*?(?=^\S|\Z)', '',
+                  text, flags=re.M | re.S)
+
+with open(path, 'w') as f:
+    f.write(text)
+print("config.yaml updated.")
+PYEOF
+    fi
+
+    # Apply the new rules immediately (no restart needed)
+    if [ -n "$VALID_FWD" ]; then
+        /usr/local/libexec/spoof-tunnel-forward
+    fi
+
+    echo ""
+    echo "  Forwarding rules applied. No service restart required."
+}
+
+# ── update ────────────────────────────────────────────────────────────────────
+
+cmd_update() {
+    need_root
+
+    # Load repo URL
+    REPO_URL=""
+    [ -f "$UPDATE_CONF" ] && source "$UPDATE_CONF" 2>/dev/null || true
+    if [ -z "${REPO_URL:-}" ]; then
+        echo ""
+        echo "  Repository URL not configured."
+        read -rp "  GitHub repo URL (e.g. https://github.com/imanxboy/spoof-tunnel): " REPO_URL || true
+        [ -z "$REPO_URL" ] && die "Repo URL required."
+        echo "REPO_URL=${REPO_URL}" > "$UPDATE_CONF"
+    fi
+
+    GH_REPO="${REPO_URL#https://github.com/}"
+    API="https://api.github.com/repos/${GH_REPO}/releases/latest"
+
+    echo ""
+    echo "  Checking for latest release..."
+    if command -v curl >/dev/null 2>&1; then
+        RELEASE=$(curl -fsSL "$API" 2>/dev/null)
+    else
+        RELEASE=$(wget -qO- "$API" 2>/dev/null)
+    fi
+
+    TAG=$(echo "$RELEASE" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name',''))" \
+        2>/dev/null || true)
+    TARBALL_URL=$(echo "$RELEASE" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); print(d.get('tarball_url',''))" \
+        2>/dev/null || true)
+
+    [ -z "$TAG" ]         && die "Could not fetch release info from: $API"
+    [ -z "$TARBALL_URL" ] && die "No tarball URL in release."
+
+    # Current version
+    CURRENT_VER="unknown"
+    [ -f "${CONF_DIR}/VERSION" ] && CURRENT_VER=$(cat "${CONF_DIR}/VERSION")
+
+    echo "  Current:  ${CURRENT_VER}"
+    echo "  Latest:   ${TAG}"
+
+    if [ "$CURRENT_VER" = "$TAG" ]; then
+        echo "  Already up to date."
+        return
+    fi
+
+    echo ""
+    read -rp "  Update to ${TAG}? [Y/n] " yn || true
+    case "${yn,,}" in n|no) echo "Aborted."; return ;; esac
+
+    # Create rollback snapshot before updating
+    echo ""
+    echo "  Creating rollback snapshot..."
+    SNAP_DIR="${BACKUP_DIR}/pre-update-${TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$SNAP_DIR"
+    [ -f "$BIN" ]       && cp "$BIN"       "${SNAP_DIR}/spoof-tunnel"
+    [ -f "$ENV_FILE" ]  && cp "$ENV_FILE"  "${SNAP_DIR}/tunnel.env"
+    [ -f "$CONF_YAML" ] && cp "$CONF_YAML" "${SNAP_DIR}/config.yaml"
+    echo "  Snapshot saved: ${SNAP_DIR}"
+
+    # Download and extract
+    WORK_DIR=$(mktemp -d)
+    trap 'rm -rf "${WORK_DIR}"' EXIT
+    echo "  Downloading ${TAG}..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$TARBALL_URL" | tar xz -C "$WORK_DIR" --strip-components=1
+    else
+        wget -qO- "$TARBALL_URL"  | tar xz -C "$WORK_DIR" --strip-components=1
+    fi
+
+    # Build
+    PKG_DIR="$WORK_DIR"
+    if [ -f "${PKG_DIR}/build.sh" ]; then
+        echo "  Building new binary..."
+        bash "${PKG_DIR}/build.sh"
+    elif [ ! -f "${PKG_DIR}/bin/spoof-tunnel" ]; then
+        die "No binary and no build.sh in release."
+    fi
+
+    # Install — run the full installer with --no-start so it regenerates the
+    # service unit (and therefore ExecStartPost lines) without starting the
+    # service prematurely.  The binary and libexec hooks are installed by
+    # install.sh; spoofctl itself is updated separately below.
+    echo "  Installing..."
+    cp -f "${CONF_YAML}" "${PKG_DIR}/config.yaml"
+    bash "${PKG_DIR}/install.sh" --no-start
+
+    # Self-update spoofctl — install.sh does not install it (only scripts/install.sh does).
+    if [ -f "${PKG_DIR}/scripts/spoofctl" ]; then
+        install -m 755 -o root -g root \
+            "${PKG_DIR}/scripts/spoofctl" /usr/local/bin/spoofctl
+        echo "  Updated: /usr/local/bin/spoofctl"
+    fi
+
+    echo "$TAG" > "${CONF_DIR}/VERSION"
+
+    # Restart and health-check
+    echo "  Restarting service..."
+    systemctl restart "${SERVICE}"
+    sleep 3
+    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
+        echo "  $(color_ok "Update successful: ${TAG}")"
+        return
+    fi
+
+    # Auto-rollback
+    echo "  $(color_err "Service failed after update — rolling back...")"
+    cp -f "${SNAP_DIR}/spoof-tunnel" "$BIN"
+    systemctl restart "${SERVICE}"
+    sleep 2
+    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
+        echo "  $(color_warn "Rolled back to previous version. Service is running.")"
+    else
+        echo "  $(color_err "Rollback also failed. Manual intervention required.")"
+        journalctl -u "${SERVICE}" -n 30 --no-pager >&2
+    fi
+    exit 1
+}
+
+# ── rollback ─────────────────────────────────────────────────────────────────
+
+cmd_rollback() {
+    need_root
+
+    if [ ! -d "$BACKUP_DIR" ]; then
+        die "No backup directory found: ${BACKUP_DIR}"
+    fi
+
+    echo ""
+    echo "  Available rollback snapshots:"
+    echo ""
+    SNAPS=()
+    i=1
+    while IFS= read -r d; do
+        SNAPS+=("$d")
+        printf "    %2d) %s\n" "$i" "$(basename "$d")"
+        (( i++ )) || true
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d | sort -r)
+
+    [ "${#SNAPS[@]}" -eq 0 ] && die "No snapshots found in ${BACKUP_DIR}."
+
+    echo ""
+    read -rp "  Select snapshot [1]: " IDX || true
+    IDX="${IDX:-1}"
+    [[ "$IDX" =~ ^[0-9]+$ ]] || die "Invalid selection."
+    [ "$IDX" -ge 1 ] && [ "$IDX" -le "${#SNAPS[@]}" ] || die "Out of range."
+    SNAP="${SNAPS[$((IDX-1))]}"
+
+    echo ""
+    echo "  Will restore from: $(basename "$SNAP")"
+    read -rp "  Confirm? [y/N] " yn || true
+    case "${yn,,}" in y|yes) ;; *) echo "Aborted."; return ;; esac
+
+    # Stop service
+    echo "  Stopping service..."
+    systemctl stop "${SERVICE}" 2>/dev/null || true
+
+    # Restore binary
+    [ -f "${SNAP}/spoof-tunnel" ] && \
+        install -m 755 "${SNAP}/spoof-tunnel" "$BIN" && \
+        echo "  Binary restored."
+
+    # Restore config (optional)
+    if [ -f "${SNAP}/config.yaml" ]; then
+        read -rp "  Restore config.yaml too? [y/N] " yn2 || true
+        case "${yn2,,}" in
+            y|yes)
+                cp -f "${SNAP}/config.yaml" "$CONF_YAML"
+                cp -f "${SNAP}/tunnel.env"  "$ENV_FILE" 2>/dev/null || true
+                echo "  Config restored."
+                ;;
+        esac
+    fi
+
+    echo "  Restarting service..."
+    systemctl start "${SERVICE}"
+    sleep 2
+    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
+        echo "  $(color_ok "Rollback complete. Service is running.")"
+    else
+        echo "  $(color_err "Service failed to start after rollback.")"
+        journalctl -u "${SERVICE}" -n 20 --no-pager >&2
+        exit 1
+    fi
+}
+
+# ── uninstall ────────────────────────────────────────────────────────────────
+
+cmd_uninstall() {
+    need_root
+
+    echo ""
+    echo "  $(color_warn "This will completely remove spoof-tunnel from this system.")"
+    echo ""
+    read -rp "  Type 'yes' to confirm uninstall: " yn || true
+    [ "$yn" = "yes" ] || { echo "Aborted."; return; }
+
+    echo ""
+    echo "  Stopping and disabling service..."
+    systemctl stop    "${SERVICE}" 2>/dev/null || true
+    systemctl disable "${SERVICE}" 2>/dev/null || true
+
+    echo "  Removing iptables forwarding rules..."
+    if [ -f "/usr/local/libexec/spoof-tunnel-forward" ] && [ -f "${ENV_FILE}" ]; then
+        /usr/local/libexec/spoof-tunnel-forward --remove 2>/dev/null || true
+    fi
+
+    echo "  Removing files..."
+    rm -f "/etc/systemd/system/${SERVICE}.service"
+    rm -f "/etc/systemd/system/${SERVICE}-prom.service"
+    rm -f "/etc/systemd/system/${SERVICE}-prom.timer"
+    rm -f "/usr/local/bin/spoof-tunnel"
+    rm -f "/usr/local/bin/spoofctl"
+    rm -f "/usr/local/libexec/spoof-tunnel-prepare"
+    rm -f "/usr/local/libexec/spoof-tunnel-qdisc"
+    rm -f "/usr/local/libexec/spoof-tunnel-forward"
+    rm -f "/etc/sysctl.d/99-spoof-tunnel.conf"
+    rm -f "/etc/cron.d/spoof-tunnel"
+    rm -f "/etc/logrotate.d/spoof-tunnel"
+    rm -rf "/usr/local/lib/spoof-tunnel"
+
+    echo ""
+    read -rp "  Remove config (/etc/spoof-tunnel)? [y/N] " yn2 || true
+    case "${yn2,,}" in
+        y|yes) rm -rf "/etc/spoof-tunnel"; echo "  Config removed." ;;
+        *) echo "  Config kept at /etc/spoof-tunnel" ;;
+    esac
+
+    echo ""
+    read -rp "  Remove logs (/var/log/spoof-tunnel)? [y/N] " yn3 || true
+    case "${yn3,,}" in
+        y|yes) rm -rf "/var/log/spoof-tunnel"; echo "  Logs removed." ;;
+        *) echo "  Logs kept at /var/log/spoof-tunnel" ;;
+    esac
+
+    systemctl daemon-reload
+
+    echo ""
+    echo "  $(color_ok "spoof-tunnel uninstalled.")"
+}
+
+# ── interactive menu ─────────────────────────────────────────────────────────
+
+show_menu() {
+    local state
+    state=$(svc_state)
+    local state_str
+    if [ "$state" = "active" ]; then
+        state_str="$(color_ok "$state")"
+    else
+        state_str="$(color_err "$state")"
+    fi
+
+    echo ""
+    hr
+    printf "  spoofctl — service: %s\n" "$state_str"
+    hr
+    echo "  1) Status"
+    echo "  2) Start"
+    echo "  3) Stop"
+    echo "  4) Restart"
+    echo "  5) Edit Config"
+    echo "  6) Change Spoof IPs"
+    echo "  7) Forwarding Rules"
+    echo "  8) Update"
+    echo "  9) Rollback"
+    echo " 10) Uninstall"
+    echo " 11) Exit"
+    hr
+    echo ""
+}
+
+interactive_menu() {
+    while true; do
+        show_menu
+        read -rp "  Choice [1-11]: " CHOICE || true
+        echo ""
+        case "$CHOICE" in
+            1)  cmd_status ;;
+            2)  cmd_start ;;
+            3)  cmd_stop ;;
+            4)  cmd_restart ;;
+            5)  cmd_edit_config ;;
+            6)  cmd_spoof_ips ;;
+            7)  cmd_forward_rules ;;
+            8)  cmd_update ;;
+            9)  cmd_rollback ;;
+            10) cmd_uninstall; break ;;
+            11|q|quit|exit) echo "  Bye."; break ;;
+            *)  echo "  Invalid choice." ;;
+        esac
+        echo ""
+        read -rp "  Press Enter to continue..." _ || true
+    done
+}
+
+# ── entry point ──────────────────────────────────────────────────────────────
+
+CMD="${1:-}"
+
+case "$CMD" in
+    "")              interactive_menu ;;
+    status)          cmd_status ;;
+    start)           cmd_start ;;
+    stop)            cmd_stop ;;
+    restart)         cmd_restart ;;
+    edit-config)     cmd_edit_config ;;
+    spoof-ips)       cmd_spoof_ips ;;
+    forward-rules)   cmd_forward_rules ;;
+    update)          cmd_update ;;
+    rollback)        cmd_rollback ;;
+    uninstall)       cmd_uninstall ;;
+    -h|--help|help)
+        echo "Usage: spoofctl [command]"
+        echo "Commands:"
+        echo "  status          Show tunnel status, metrics, and forwarding rules"
+        echo "  start           Start the service"
+        echo "  stop            Stop the service"
+        echo "  restart         Restart the service"
+        echo "  edit-config     Open config.yaml in \$EDITOR"
+        echo "  spoof-ips       Update the spoof IP list"
+        echo "  forward-rules   Update port forwarding rules (client nodes only)"
+        echo "  update          Download and install the latest release"
+        echo "  rollback        Restore a previous snapshot"
+        echo "  uninstall       Remove spoof-tunnel from this system"
+        echo ""
+        echo "With no command, shows the interactive menu."
+        ;;
+    *)
+        echo "Unknown command: $CMD" >&2
+        echo "Run 'spoofctl help' for usage." >&2
+        exit 1
+        ;;
+esac

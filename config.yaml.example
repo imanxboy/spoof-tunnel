@@ -1,0 +1,127 @@
+# spoof-tunnel-v6 configuration
+# Copy this file to config.yaml and edit before running install.sh.
+# Fields marked (required) have no default and must be set.
+# Fields marked (auto) are detected from the system if omitted.
+
+# ── identity ────────────────────────────────────────────────────────────────
+tunnel:
+  # Role of this host. One end must be "server", the other "client".
+  role: server                    # (required) server | client
+
+  # Transport protocol for the outer tunnel.
+  # udp: AF_PACKET + IP spoofing (high performance, requires CAP_NET_RAW)
+  # tcp: standard TCP connection (works through UDP-blocking firewalls)
+  outer: udp                      # udp | tcp  (default: udp)
+
+  # Real IP address of the peer host.
+  peer_address: YOUR_IRAN_SERVER_IP     # (required)
+
+  # Ports used for the tunnel. Must match on both ends.
+  listen_port: 2080               # default: 2080
+  peer_port: 2080                 # default: 2080
+
+# ── spoofing (UDP mode only) ─────────────────────────────────────────────────
+spoof:
+  # One or more source IPs to use for outgoing spoofed packets.
+  # Multiple IPs enable active/standby failover.
+  # If only one IP is listed, failover is disabled.
+  addresses:
+    - ip-spoof-example                # (required for UDP mode)
+    # - ip-spoof-example-2              # standby spoof IP
+
+  # Automatic failover thresholds.
+  # If the active spoof IP sustains loss_threshold packet loss for
+  # failover_intervals consecutive metric intervals, rotate to the next IP.
+  loss_threshold: 0.05            # 5% — rotate if loss exceeds this
+  failover_intervals: 3           # 3 consecutive bad intervals (~15s default)
+
+# ── network ──────────────────────────────────────────────────────────────────
+network:
+  # Physical network interface (UDP mode only).
+  # Leave blank for auto-detection from the default route.
+  interface: ""                   # (auto) e.g. ens3, eth0, enp3s0
+
+  # TUN device name.
+  tun_name: tun0                  # default: tun0
+
+  # Inner (TUN) IP addresses. Both ends must use matching addresses.
+  # Leave blank to use the default pair (10.100.100.1/10.100.100.2).
+  local_tun_ip: ""                # (auto) e.g. 10.100.100.1
+  peer_tun_ip: ""                 # (auto) e.g. 10.100.100.2
+
+  # Inner MTU. Leave blank to auto-compute from the physical interface MTU.
+  # Formula: min(1440, physical_mtu - 58)
+  mtu: 0                          # (auto)
+
+# ── performance ──────────────────────────────────────────────────────────────
+performance:
+  # TX pacing rate limit in Mbps (UDP mode only).
+  # Set to 80% of your server's contracted uplink.
+  rate_mbps: 1000                 # (required for UDP mode) — 80% of a 1 Gbps uplink
+
+  # Per-flow fq queue depth (packets).
+  # Auto-computed as max(1000, min(10000, rate_mbps * 9)) if set to 0.
+  flow_limit: 0                   # (auto)
+
+  # TX batch size: number of packets sent per sendmmsg call (UDP mode).
+  # Lower values reduce queue pressure on congested paths.
+  batch_size: 16                  # default: 16
+
+  # TPACKET_V3 RX ring block count. Each block is 1 MiB.
+  # Total ring size = rx_ring_blocks * 1 MiB (mlock'd).
+  rx_ring_blocks: 64              # default: 64 (= 64 MiB)
+
+  # CPU affinity for TX and RX threads.
+  # Leave -1 for auto-detection.
+  tx_cpu: -1                      # (auto)
+  rx_cpu: -1                      # (auto)
+
+# ── monitoring ───────────────────────────────────────────────────────────────
+monitoring:
+  # Interval for metrics output in seconds.
+  metric_interval: 5              # default: 5
+
+  # Write JSON metric lines to /var/log/spoof-tunnel/metrics.jsonl.
+  # Enables historical reporting and Prometheus export.
+  json_metrics: true              # default: true
+
+  # Enable Prometheus textfile export (requires node_exporter).
+  prometheus_enabled: false       # default: false
+  prometheus_dir: /var/lib/prometheus/node-exporter
+
+  # qdisc monitoring cron interval in seconds.
+  qdisc_monitor_interval: 60     # default: 60
+
+  # Log retention in days.
+  log_retention_days: 30          # default: 30
+
+# ── advanced ─────────────────────────────────────────────────────────────────
+advanced:
+  # Apply recommended kernel sysctl parameters on install.
+  sysctl_tune: true               # default: true
+
+  # systemd WatchdogSec: the service restarts if the metrics thread stalls.
+  # Set to 0 to disable.
+  watchdog_sec: 30                # default: 30
+
+# ── forwarding (CLIENT role only) ────────────────────────────────────────────
+forwarding:
+  # Ports to forward from the client's public interface through the tunnel to
+  # the server's TUN IP. Both TCP and UDP are forwarded for every listed port.
+  #
+  # For each port N, the installer creates:
+  #   iptables -t nat -A PREROUTING -p tcp --dport N -j DNAT --to-destination PEER_TUN:N
+  #   iptables -t nat -A PREROUTING -p udp --dport N -j DNAT --to-destination PEER_TUN:N
+  #   iptables -A FORWARD -i IFACE -o tun0 -j ACCEPT
+  #   iptables -A FORWARD -i tun0 -o IFACE -j ACCEPT
+  #   iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
+  #
+  # SERVER nodes: remove or comment out this entire section.
+  # Xray on the server accepts tunnel connections directly on the TUN IP.
+  #
+  # Leave ports empty (or omit this section) to configure manually later with:
+  #   spoofctl forward-rules
+  ports:
+    - 443
+    # - 80
+    # - 2053    # DNS-over-HTTPS alternative port

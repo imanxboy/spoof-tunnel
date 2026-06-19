@@ -1,0 +1,149 @@
+#!/bin/bash
+# spoof-tunnel-forward — install / remove iptables port-forwarding rules
+#
+# Usage:
+#   spoof-tunnel-forward            install rules  (ExecStartPost)
+#   spoof-tunnel-forward --remove   remove rules   (called by uninstall)
+#
+# ── What this script does ────────────────────────────────────────────────────
+#
+# CLIENT nodes only. For each port in FORWARD_PORTS (e.g. "443,80,2053"):
+#
+#  1. PREROUTING DNAT (both TCP and UDP)
+#       iptables -t nat -A PREROUTING -p tcp --dport PORT
+#           -j DNAT --to-destination PEER_TUN:PORT
+#       iptables -t nat -A PREROUTING -p udp --dport PORT
+#           -j DNAT --to-destination PEER_TUN:PORT
+#
+#     Redirects connections arriving on the client's public interface to the
+#     server's TUN IP so they travel through the tunnel.
+#
+#  2. FORWARD chain
+#       iptables -A FORWARD -i IFACE -o TUN -j ACCEPT
+#       iptables -A FORWARD -i TUN   -o IFACE -j ACCEPT
+#
+#     Required when the default FORWARD policy is DROP (e.g. when ufw is
+#     active). Without these rules, forwarded packets are silently dropped
+#     in the FORWARD chain before they reach the TUN interface or the user.
+#
+#  3. POSTROUTING MASQUERADE on the TUN interface
+#       iptables -t nat -A POSTROUTING -o TUN -j MASQUERADE
+#
+#     CRITICAL for the return path. After DNAT the packet still carries the
+#     user's real source IP. If the server receives src=user_real_ip, its
+#     kernel routes the reply directly to the internet — bypassing the
+#     tunnel. MASQUERADE replaces the source with the client's TUN IP
+#     (10.100.100.2), so the server routes replies back through the tunnel.
+#     conntrack then reverses the MASQUERADE and DNAT for the reply.
+#
+# SERVER nodes: exit immediately. Xray listens directly on the TUN IP
+#   (LOCAL_TUN on the server = PEER_TUN from the client's perspective).
+#   No iptables forwarding rules are needed on the server.
+#
+# Idempotent: "iptables -C" is used before every insert — safe to call on
+#   every service start/restart without creating duplicate rules.
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+ACTION="${1:-install}"
+source /etc/spoof-tunnel/tunnel.env
+
+[ "${MODE:-}" = "client" ] || exit 0
+
+TUN="${TUN_NAME:-tun0}"
+PEER_TUN_IP="${PEER_TUN:-10.100.100.1}"
+PHYS="${IFACE:-eth0}"
+
+# ── remove mode ───────────────────────────────────────────────────────────────
+
+if [ "$ACTION" = "--remove" ]; then
+    removed=0
+
+    if [ -n "${FORWARD_PORTS:-}" ]; then
+        IFS=',' read -ra _PORTS <<< "${FORWARD_PORTS}"
+        for port in "${_PORTS[@]}"; do
+            port="${port// /}"
+            [ -z "$port" ] && continue
+            for proto in tcp udp; do
+                while iptables -t nat -C PREROUTING \
+                        -p "$proto" --dport "$port" \
+                        -j DNAT --to-destination "${PEER_TUN_IP}:${port}" 2>/dev/null; do
+                    iptables -t nat -D PREROUTING \
+                        -p "$proto" --dport "$port" \
+                        -j DNAT --to-destination "${PEER_TUN_IP}:${port}"
+                    removed=$(( removed + 1 ))
+                done
+            done
+        done
+    fi
+
+    # FORWARD chain rules
+    while iptables -C FORWARD \
+            -i "${PHYS}" -o "${TUN}" -j ACCEPT 2>/dev/null; do
+        iptables -D FORWARD -i "${PHYS}" -o "${TUN}" -j ACCEPT
+        removed=$(( removed + 1 ))
+    done
+    while iptables -C FORWARD \
+            -i "${TUN}" -o "${PHYS}" -j ACCEPT 2>/dev/null; do
+        iptables -D FORWARD -i "${TUN}" -o "${PHYS}" -j ACCEPT
+        removed=$(( removed + 1 ))
+    done
+
+    # MASQUERADE
+    while iptables -t nat -C POSTROUTING \
+            -o "${TUN}" -j MASQUERADE 2>/dev/null; do
+        iptables -t nat -D POSTROUTING -o "${TUN}" -j MASQUERADE
+        removed=$(( removed + 1 ))
+    done
+
+    if [ "$removed" -gt 0 ]; then
+        echo "spoof-tunnel-forward: removed ${removed} forwarding rule(s)"
+    else
+        echo "spoof-tunnel-forward: no forwarding rules to remove"
+    fi
+    exit 0
+fi
+
+# ── install mode ──────────────────────────────────────────────────────────────
+
+if [ -z "${FORWARD_PORTS:-}" ]; then
+    exit 0
+fi
+
+# 1. PREROUTING DNAT — one TCP + one UDP rule per port
+IFS=',' read -ra _PORTS <<< "${FORWARD_PORTS}"
+for port in "${_PORTS[@]}"; do
+    port="${port// /}"
+    [ -z "$port" ] && continue
+    for proto in tcp udp; do
+        if ! iptables -t nat -C PREROUTING \
+                -p "$proto" --dport "$port" \
+                -j DNAT --to-destination "${PEER_TUN_IP}:${port}" 2>/dev/null; then
+            iptables -t nat -A PREROUTING \
+                -p "$proto" --dport "$port" \
+                -j DNAT --to-destination "${PEER_TUN_IP}:${port}"
+            echo "spoof-tunnel-forward: DNAT ${proto}:${port} → ${PEER_TUN_IP}:${port}"
+        fi
+    done
+done
+
+# 2. FORWARD chain — allow traffic between the physical interface and tun0
+#    Necessary when the default FORWARD policy is DROP (e.g. ufw).
+if ! iptables -C FORWARD \
+        -i "${PHYS}" -o "${TUN}" -j ACCEPT 2>/dev/null; then
+    iptables -A FORWARD -i "${PHYS}" -o "${TUN}" -j ACCEPT
+    echo "spoof-tunnel-forward: FORWARD ${PHYS} → ${TUN} ACCEPT"
+fi
+if ! iptables -C FORWARD \
+        -i "${TUN}" -o "${PHYS}" -j ACCEPT 2>/dev/null; then
+    iptables -A FORWARD -i "${TUN}" -o "${PHYS}" -j ACCEPT
+    echo "spoof-tunnel-forward: FORWARD ${TUN} → ${PHYS} ACCEPT"
+fi
+
+# 3. POSTROUTING MASQUERADE — replace user src IP with client TUN IP so that
+#    the server routes replies back through the tunnel (not via the internet).
+if ! iptables -t nat -C POSTROUTING \
+        -o "${TUN}" -j MASQUERADE 2>/dev/null; then
+    iptables -t nat -A POSTROUTING -o "${TUN}" -j MASQUERADE
+    echo "spoof-tunnel-forward: MASQUERADE on ${TUN}"
+fi
