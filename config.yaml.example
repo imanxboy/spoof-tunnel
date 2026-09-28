@@ -120,7 +120,7 @@ forwarding:
   # Xray on the server accepts tunnel connections directly on the TUN IP.
   #
   # Leave ports empty (or omit this section) to configure manually later with:
-  #   spoofctl forward-rules
+  #   spoofctl forward add 443
   ports:
     - 443
     # - 80

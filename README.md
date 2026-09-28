@@ -181,9 +181,17 @@ reboots. They are removed cleanly during uninstall.
 
 **Manage after install:**
 ```bash
-spoofctl forward-rules   # interactive: update port list and re-apply rules
-spoofctl status          # shows forwarded ports + live DNAT/MASQUERADE counts
+spoofctl forward list        # configured ports + live DNAT/MASQUERADE state
+spoofctl forward add 8443    # add a port, keeping the existing ones
+spoofctl forward del 8443    # remove one port ('all' removes every rule)
+spoofctl forward replace 443,80   # replace the whole list at once
+spoofctl forward apply       # re-install rules after a manual iptables flush
 ```
+
+`add` and `del` take a comma-separated list (`forward add 8443,2053`) and
+change iptables immediately — no service restart. Every change is written to
+both `tunnel.env` and `config.yaml`, so it survives a reinstall. Run any
+subcommand with no argument to be prompted for the ports.
 
 **spoofctl status output (client):**
 ```
@@ -213,10 +221,31 @@ spoofctl [command]
 | `restart` | Restart the service |
 | `edit-config` | Open `config.yaml` in `$EDITOR` and optionally restart |
 | `spoof-ips` | Update the spoof IP list and restart |
-| `forward-rules` | Update forwarded port list and re-apply iptables rules (client only) |
+| `forward list\|add\|del\|replace\|apply` | Manage forwarded ports (client only) |
+| `create` | Set up a new tunnel with the wizard (after `delete`) |
+| `delete` | Remove the configured tunnel, keeping the tooling installed |
 | `update` | Download and install the latest release (auto-rollback on failure) |
 | `rollback` | Restore a previous snapshot |
 | `uninstall` | Remove everything from this system |
+
+`forward-rules` is kept as an alias for `forward replace`.
+
+### Deleting a tunnel
+
+`spoofctl delete` tears down the tunnel configured on this host without
+uninstalling anything:
+
+- stops and disables the service (and the Prometheus timer, if enabled)
+- removes every iptables rule the tunnel owns — the port-forwarding DNAT,
+  FORWARD and MASQUERADE rules, and the `INPUT ... -j DROP` rule that
+  `spoof-tunnel-prepare` installs on the outer UDP port
+- deletes the TUN device
+- backs up `config.yaml` and `tunnel.env` to
+  `/var/backups/spoof-tunnel/deleted-<timestamp>/`, then removes them
+
+The binary, `spoofctl`, the libexec hooks and the logs stay in place, so
+`spoofctl create` can build a new tunnel straight away. Use
+`spoofctl uninstall` to remove the tooling itself.
 
 With no arguments, `spoofctl` opens an interactive numbered menu.
 

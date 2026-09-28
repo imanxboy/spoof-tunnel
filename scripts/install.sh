@@ -121,7 +121,7 @@ fi
 if [ -z "$TAG" ]; then
     die "Could not determine release tag. Ensure a release has been published at:
        ${API_BASE}/releases/latest
-  If no releases exist yet, create one via: git tag v6.0.0 && git push --tags"
+  If no releases exist yet, create one via: git tag v6.1.0 && git push --tags"
 fi
 log "Installing version: ${TAG}"
 

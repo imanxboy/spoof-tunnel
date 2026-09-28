@@ -164,9 +164,17 @@ iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
 
 **مدیریت پس از نصب:**
 ```bash
-spoofctl forward-rules   # به‌روزرسانی لیست پورت‌ها و اعمال مجدد قوانین
-spoofctl status          # نمایش پورت‌های فوروارد شده و وضعیت NAT
+spoofctl forward list        # پورت‌های تنظیم‌شده و قوانین زنده‌ی iptables
+spoofctl forward add 8443    # افزودن یک پورت بدون دست‌زدن به بقیه
+spoofctl forward del 8443    # حذف یک پورت ('all' همه‌ی قوانین را پاک می‌کند)
+spoofctl forward replace 443,80   # جایگزینی کل لیست
+spoofctl forward apply       # اعمال مجدد قوانین بعد از flush دستی iptables
 ```
+
+`add` و `del` لیست جداشده با کاما هم می‌پذیرند (`forward add 8443,2053`) و
+بلافاصله iptables را تغییر می‌دهند — بدون restart سرویس. هر تغییر هم در
+`tunnel.env` و هم در `config.yaml` نوشته می‌شود تا بعد از نصب مجدد باقی بماند.
+اگر زیردستور را بدون آرگومان اجرا کنی، پورت‌ها را از تو می‌پرسد.
 
 **خروجی `spoofctl status` (کلاینت):**
 ```
@@ -195,10 +203,31 @@ spoofctl [دستور]
 | `restart` | راه‌اندازی مجدد |
 | `edit-config` | باز کردن `config.yaml` در ویرایشگر |
 | `spoof-ips` | به‌روزرسانی لیست IP‌های جعلی |
-| `forward-rules` | به‌روزرسانی پورت‌های فوروارد و اعمال مجدد قوانین (فقط کلاینت) |
+| `forward list\|add\|del\|replace\|apply` | مدیریت پورت‌های فوروارد (فقط کلاینت) |
+| `create` | ساخت تانل جدید با ویزارد (بعد از `delete`) |
+| `delete` | حذف تانل تنظیم‌شده، بدون حذف خود اسکریپت |
 | `update` | دانلود و نصب آخرین نسخه (با rollback خودکار در صورت خطا) |
 | `rollback` | بازگشت به نسخه قبلی |
 | `uninstall` | حذف کامل از سیستم |
+
+`forward-rules` به‌عنوان نام مستعار `forward replace` باقی مانده است.
+
+### حذف تانل
+
+دستور `spoofctl delete` تانل تنظیم‌شده روی این هاست را برمی‌دارد، بدون اینکه
+چیزی را از سیستم حذف کند:
+
+- سرویس را stop و disable می‌کند (و تایمر Prometheus را اگر فعال باشد)
+- تمام قوانین iptables متعلق به تانل را پاک می‌کند — DNAT و FORWARD و
+  MASQUERADE مربوط به port forwarding، و همچنین قانون `INPUT ... -j DROP`
+  که `spoof-tunnel-prepare` روی پورت UDP بیرونی می‌گذارد
+- دیوایس TUN را حذف می‌کند
+- از `config.yaml` و `tunnel.env` در مسیر
+  `/var/backups/spoof-tunnel/deleted-<timestamp>/` بکاپ می‌گیرد و بعد پاکشان می‌کند
+
+باینری، `spoofctl`، هوک‌های libexec و لاگ‌ها سر جایشان می‌مانند، پس بلافاصله
+می‌توانی با `spoofctl create` یک تانل جدید بسازی. برای حذف کامل خود اسکریپت از
+`spoofctl uninstall` استفاده کن.
 
 اگر بدون آرگومان اجرا شود، منوی تعاملی نمایش می‌دهد:
 
@@ -212,11 +241,13 @@ spoofctl [دستور]
    4) Restart
    5) Edit Config
    6) Change Spoof IPs
-   7) Forwarding Rules
-   8) Update
-   9) Rollback
-  10) Uninstall
-  11) Exit
+   7) Port Forwarding...
+   8) Create Tunnel
+   9) Delete Tunnel
+  10) Update
+  11) Rollback
+  12) Uninstall
+  13) Exit
 ```
 
 ---

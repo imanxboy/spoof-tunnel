@@ -1,7 +1,9 @@
 #!/bin/bash
 # spoofctl — management CLI for spoof-tunnel v6
 # Usage: spoofctl [command]
-#   Commands: status start stop restart edit-config spoof-ips forward-rules update rollback uninstall
+#   Commands: status start stop restart edit-config spoof-ips
+#             forward list|add|del|replace|apply   (alias: forward-rules)
+#             create delete update rollback uninstall
 #   No command → interactive menu
 set -euo pipefail
 
@@ -16,6 +18,12 @@ HEALTH_JSON="/run/spoof-tunnel/health.json"
 BACKUP_DIR="/var/backups/spoof-tunnel"
 SERVICE="spoof-tunnel"
 UPDATE_CONF="${CONF_DIR}/update.conf"
+LIBEXEC_DIR="/usr/local/libexec"
+FORWARD_HOOK="${LIBEXEC_DIR}/spoof-tunnel-forward"
+PREPARE_HOOK="${LIBEXEC_DIR}/spoof-tunnel-prepare"
+QDISC_HOOK="${LIBEXEC_DIR}/spoof-tunnel-qdisc"
+WIZARD="${LIB_DIR}/setup-wizard.sh"
+SERVICE_FILE="/etc/systemd/system/${SERVICE}.service"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -30,6 +38,45 @@ color_err()  { printf '\033[0;31m%s\033[0m' "$*"; }
 
 is_installed() {
     [ -f "$BIN" ] && [ -f "$ENV_FILE" ]
+}
+
+# The toolchain (binary, spoofctl, hooks) is present, regardless of whether a
+# tunnel is currently configured on top of it.
+toolchain_present() {
+    [ -f "$BIN" ]
+}
+
+# A tunnel has been created on this host: config.yaml and/or tunnel.env exist.
+has_tunnel() {
+    [ -f "$ENV_FILE" ] || [ -f "$CONF_YAML" ]
+}
+
+# Remove the INPUT DROP rule that spoof-tunnel-prepare installs for the outer
+# UDP port. Nothing else removes it, so both 'delete' and 'uninstall' call this
+# — otherwise the port stays black-holed after the tunnel is gone.
+drop_input_rule() {
+    local port="${1:-${LISTEN_PORT:-}}"
+    [ -n "$port" ] || return 0
+    local n=0
+    while iptables -C INPUT -p udp --dport "$port" -j DROP 2>/dev/null; do
+        iptables -D INPUT -p udp --dport "$port" -j DROP
+        n=$(( n + 1 ))
+    done
+    [ "$n" -gt 0 ] && echo "  Removed INPUT DROP rule for udp/${port}."
+    return 0
+}
+
+# Tear down the TUN device. The tunnel process normally removes it on exit, but
+# a killed process (or a crash) leaves it behind and blocks a clean re-create.
+del_tun_device() {
+    local tun="${1:-${TUN_NAME:-tun0}}"
+    [ -n "$tun" ] || return 0
+    if ip link show "$tun" >/dev/null 2>&1; then
+        ip link set "$tun" down 2>/dev/null || true
+        ip link delete "$tun" 2>/dev/null || true
+        echo "  Removed TUN device: ${tun}"
+    fi
+    return 0
 }
 
 svc_state() {
@@ -48,8 +95,13 @@ hr() {
 # ── status ───────────────────────────────────────────────────────────────────
 
 cmd_status() {
-    if ! is_installed; then
+    if ! toolchain_present; then
         echo "spoof-tunnel is not installed."
+        return
+    fi
+    if ! is_installed; then
+        echo "spoof-tunnel is installed, but no tunnel is configured."
+        echo "Create one with: spoofctl create"
         return
     fi
     if [ -x "${LIB_DIR}/status.sh" ]; then
@@ -205,60 +257,42 @@ PYEOF
     esac
 }
 
-# ── forward-rules ────────────────────────────────────────────────────────────
+# ── port forwarding ─────────────────────────────────────────────────────────
+#
+# FORWARD_PORTS in tunnel.env is the source of truth for the running rules;
+# forwarding.ports in config.yaml is the source of truth across reinstalls.
+# Every mutation writes both, then reconciles iptables.
 
-cmd_forward_rules() {
-    need_root
-    load_env
-
+# Forwarding only applies to client nodes.
+fwd_guard() {
     if [ "${MODE:-}" = "server" ]; then
         echo "  This node is a SERVER. Port forwarding is only used on CLIENT nodes."
         echo "  Xray on the server accepts connections directly from the tunnel IP."
-        return
+        return 1
     fi
+    return 0
+}
 
-    echo ""
-    echo "  Current forwarded ports: ${FORWARD_PORTS:-none}"
-    echo "  Peer TUN IP:             ${PEER_TUN:-10.100.100.1}"
-    echo ""
-    echo "  Enter port numbers to forward (TCP+UDP both implied per port)."
-    echo "  Example: 443,80,2053"
-    echo "  Leave empty to clear all forwarding rules."
-    echo ""
-    read -rp "  Ports [${FORWARD_PORTS:-none}]: " NEW_FWD || true
-    NEW_FWD="${NEW_FWD// /}"
+# Validate one port. Echoes the normalised port on success.
+fwd_valid_port() {
+    local p="${1// /}"
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || return 1
+    printf '%s' "$p"
+}
 
-    # Validate port numbers
-    VALID_FWD=""
-    if [ -n "$NEW_FWD" ]; then
-        IFS=',' read -ra _ARR <<< "$NEW_FWD"
-        for _p in "${_ARR[@]}"; do
-            _p="${_p// /}"
-            [ -z "$_p" ] && continue
-            if [[ "$_p" =~ ^[0-9]+$ ]] \
-               && [ "$_p" -ge 1 ] && [ "$_p" -le 65535 ]; then
-                VALID_FWD="${VALID_FWD:+$VALID_FWD,}${_p}"
-            else
-                echo "  WARNING: '${_p}' is not a valid port (1–65535) — skipping."
-            fi
-        done
-    fi
+# Persist a comma-separated port list to tunnel.env and config.yaml.
+fwd_persist() {
+    local list="$1"
 
-    echo "  Setting FORWARD_PORTS=${VALID_FWD:-<empty>}"
-
-    # Remove old iptables rules before applying the new set
-    /usr/local/libexec/spoof-tunnel-forward --remove 2>/dev/null || true
-
-    # Update tunnel.env
     if grep -q '^FORWARD_PORTS=' "$ENV_FILE"; then
-        sed -i "s|^FORWARD_PORTS=.*|FORWARD_PORTS=${VALID_FWD}|" "$ENV_FILE"
+        sed -i "s|^FORWARD_PORTS=.*|FORWARD_PORTS=${list}|" "$ENV_FILE"
     else
-        echo "FORWARD_PORTS=${VALID_FWD}" >> "$ENV_FILE"
+        echo "FORWARD_PORTS=${list}" >> "$ENV_FILE"
     fi
 
-    # Update config.yaml forwarding.ports section
-    if [ -f "$CONF_YAML" ]; then
-        python3 - "$CONF_YAML" "$VALID_FWD" << 'PYEOF'
+    [ -f "$CONF_YAML" ] || return 0
+    python3 - "$CONF_YAML" "$list" << 'PYEOF'
 import sys, re
 path  = sys.argv[1]
 ports = [p.strip() for p in sys.argv[2].split(',') if p.strip()] if sys.argv[2] else []
@@ -281,17 +315,307 @@ else:
 
 with open(path, 'w') as f:
     f.write(text)
-print("config.yaml updated.")
 PYEOF
+}
+
+# ── forward list ────────────────────────────────────────────────────────────
+
+cmd_forward_list() {
+    load_env
+    echo ""
+    hr
+    printf "  Port forwarding — %s node\n" "${MODE:-unknown}"
+    hr
+    if [ "${MODE:-}" = "server" ]; then
+        echo "  Not applicable on a server node."
+        hr
+        return
     fi
 
-    # Apply the new rules immediately (no restart needed)
-    if [ -n "$VALID_FWD" ]; then
-        /usr/local/libexec/spoof-tunnel-forward
+    printf "  Peer TUN IP: %s\n" "${PEER_TUN:-10.100.100.1}"
+    printf "  Configured:  %s\n" "${FORWARD_PORTS:-none}"
+    echo ""
+
+    if [ "$(id -u)" != "0" ]; then
+        echo "  (run as root to see the live iptables rules)"
+        hr
+        return
     fi
+
+    echo "  Live DNAT rules:"
+    local found=0 _p proto protos
+    if [ -n "${FORWARD_PORTS:-}" ]; then
+        IFS=',' read -ra _PORTS <<< "${FORWARD_PORTS}"
+        for _p in "${_PORTS[@]}"; do
+            _p="${_p// /}"
+            [ -z "$_p" ] && continue
+            protos=""
+            for proto in tcp udp; do
+                if iptables -t nat -C PREROUTING -p "$proto" --dport "$_p" \
+                        -j DNAT --to-destination "${PEER_TUN:-10.100.100.1}:${_p}" \
+                        2>/dev/null; then
+                    protos="${protos:+$protos+}${proto}"
+                fi
+            done
+            if [ -n "$protos" ]; then
+                printf "    %-7s %s → %s:%s  [%s]\n" "$_p" \
+                    "$(color_ok "active")" "${PEER_TUN:-10.100.100.1}" "$_p" "$protos"
+            else
+                printf "    %-7s %s\n" "$_p" \
+                    "$(color_warn "configured, rule missing — run: spoofctl forward apply")"
+            fi
+            found=1
+        done
+    fi
+    [ "$found" = "0" ] && echo "    (none)"
+
+    # Shared rules that every per-port DNAT depends on for the return path.
+    echo ""
+    if iptables -t nat -C POSTROUTING -o "${TUN_NAME:-tun0}" -j MASQUERADE 2>/dev/null; then
+        printf "  MASQUERADE on %s: %s\n" "${TUN_NAME:-tun0}" "$(color_ok "yes")"
+    else
+        printf "  MASQUERADE on %s: %s\n" "${TUN_NAME:-tun0}" "$(color_warn "no")"
+    fi
+    hr
+}
+
+# ── forward add ─────────────────────────────────────────────────────────────
+
+cmd_forward_add() {
+    need_root
+    load_env
+    fwd_guard || return 0
+
+    local input="${1:-}"
+    if [ -z "$input" ]; then
+        echo ""
+        echo "  Current forwarded ports: ${FORWARD_PORTS:-none}"
+        echo "  Enter one or more ports to ADD (comma-separated). TCP+UDP both."
+        read -rp "  Port(s) to add: " input || true
+    fi
+    input="${input// /}"
+    [ -z "$input" ] && { echo "  Nothing to add."; return; }
+
+    local list="${FORWARD_PORTS:-}" added="" _raw _p
+    IFS=',' read -ra _ARR <<< "$input"
+    for _raw in "${_ARR[@]}"; do
+        [ -z "${_raw// /}" ] && continue
+        if ! _p="$(fwd_valid_port "$_raw")"; then
+            echo "  WARNING: '${_raw}' is not a valid port (1–65535) — skipping."
+            continue
+        fi
+        if [ "$_p" = "${LISTEN_PORT:-}" ]; then
+            echo "  WARNING: ${_p} is the tunnel's own listen port — skipping."
+            continue
+        fi
+        if [[ ",${list}," == *",${_p},"* ]]; then
+            echo "  Port ${_p} is already forwarded — skipping."
+            continue
+        fi
+        list="${list:+$list,}${_p}"
+        added="${added:+$added,}${_p}"
+    done
+
+    [ -z "$added" ] && { echo "  No new ports added."; return; }
+
+    fwd_persist "$list"
+    export FORWARD_PORTS="$list"
+
+    # Install mode is idempotent (iptables -C before every insert), so this
+    # only creates rules for the ports that are genuinely new.
+    "${FORWARD_HOOK}"
+
+    echo ""
+    echo "  $(color_ok "Added: ${added}")"
+    echo "  Forwarded ports: ${list}"
+    echo "  No service restart required."
+}
+
+# ── forward del ─────────────────────────────────────────────────────────────
+
+cmd_forward_del() {
+    need_root
+    load_env
+    fwd_guard || return 0
+
+    if [ -z "${FORWARD_PORTS:-}" ]; then
+        echo "  No ports are currently forwarded."
+        return
+    fi
+
+    local input="${1:-}"
+    if [ -z "$input" ]; then
+        echo ""
+        echo "  Currently forwarded: ${FORWARD_PORTS}"
+        echo "  Enter one or more ports to REMOVE (comma-separated),"
+        echo "  or 'all' to remove every forwarding rule."
+        read -rp "  Port(s) to remove: " input || true
+    fi
+    input="${input// /}"
+    [ -z "$input" ] && { echo "  Nothing to remove."; return; }
+
+    if [ "${input,,}" = "all" ]; then
+        "${FORWARD_HOOK}" --remove || true
+        fwd_persist ""
+        export FORWARD_PORTS=""
+        echo ""
+        echo "  $(color_ok "All forwarding rules removed.")"
+        return
+    fi
+
+    local removed="" keep="" _raw _p _d drop
+    local -a to_remove=()
+    IFS=',' read -ra _ARR <<< "$input"
+    for _raw in "${_ARR[@]}"; do
+        _p="${_raw// /}"
+        [ -z "$_p" ] && continue
+        if [[ ",${FORWARD_PORTS}," != *",${_p},"* ]]; then
+            echo "  Port ${_p} is not in the forwarding list — skipping."
+            continue
+        fi
+        to_remove+=("$_p")
+        removed="${removed:+$removed,}${_p}"
+    done
+
+    [ "${#to_remove[@]}" -eq 0 ] && { echo "  Nothing removed."; return; }
+
+    IFS=',' read -ra _CUR <<< "${FORWARD_PORTS}"
+    for _p in "${_CUR[@]}"; do
+        _p="${_p// /}"
+        [ -z "$_p" ] && continue
+        drop=0
+        for _d in "${to_remove[@]}"; do
+            if [ "$_p" = "$_d" ]; then drop=1; break; fi
+        done
+        [ "$drop" = "0" ] && keep="${keep:+$keep,}${_p}"
+    done
+
+    if [ -z "$keep" ]; then
+        # Last port removed — tear down the shared FORWARD/MASQUERADE rules too.
+        "${FORWARD_HOOK}" --remove || true
+    else
+        for _d in "${to_remove[@]}"; do
+            "${FORWARD_HOOK}" --remove-port "$_d" || true
+        done
+    fi
+
+    fwd_persist "$keep"
+    export FORWARD_PORTS="$keep"
+
+    echo ""
+    echo "  $(color_ok "Removed: ${removed}")"
+    echo "  Forwarded ports: ${keep:-none}"
+    echo "  No service restart required."
+}
+
+# ── forward replace (the old full-list behaviour) ───────────────────────────
+
+cmd_forward_replace() {
+    need_root
+    load_env
+    fwd_guard || return 0
+
+    local input="${1:-}"
+    if [ -z "$input" ]; then
+        echo ""
+        echo "  Current forwarded ports: ${FORWARD_PORTS:-none}"
+        echo "  Peer TUN IP:             ${PEER_TUN:-10.100.100.1}"
+        echo ""
+        echo "  Enter the complete port list (TCP+UDP both implied per port)."
+        echo "  Example: 443,80,2053"
+        echo "  Leave empty to clear all forwarding rules."
+        echo ""
+        read -rp "  Ports [${FORWARD_PORTS:-none}]: " input || true
+    fi
+    input="${input// /}"
+
+    local valid="" _raw _p
+    if [ -n "$input" ]; then
+        IFS=',' read -ra _ARR <<< "$input"
+        for _raw in "${_ARR[@]}"; do
+            [ -z "${_raw// /}" ] && continue
+            if _p="$(fwd_valid_port "$_raw")"; then
+                [[ ",${valid}," == *",${_p},"* ]] && continue
+                valid="${valid:+$valid,}${_p}"
+            else
+                echo "  WARNING: '${_raw}' is not a valid port (1–65535) — skipping."
+            fi
+        done
+    fi
+
+    echo "  Setting FORWARD_PORTS=${valid:-<empty>}"
+
+    # Remove the old rule set before applying the new one.
+    "${FORWARD_HOOK}" --remove 2>/dev/null || true
+
+    fwd_persist "$valid"
+    export FORWARD_PORTS="$valid"
+
+    [ -n "$valid" ] && "${FORWARD_HOOK}"
 
     echo ""
     echo "  Forwarding rules applied. No service restart required."
+}
+
+# ── forward apply ───────────────────────────────────────────────────────────
+
+# Re-install the rules for the configured port list — after a manual iptables
+# flush, or when the list was edited through 'edit-config'.
+cmd_forward_apply() {
+    need_root
+    load_env
+    fwd_guard || return 0
+    if [ -z "${FORWARD_PORTS:-}" ]; then
+        echo "  No ports configured — nothing to apply."
+        return
+    fi
+    "${FORWARD_HOOK}"
+    echo ""
+    echo "  $(color_ok "Rules re-applied for: ${FORWARD_PORTS}")"
+}
+
+# ── forward dispatcher ──────────────────────────────────────────────────────
+
+cmd_forward() {
+    is_installed || die "No tunnel is configured on this host. Run: spoofctl create"
+    local sub="${1:-list}"
+    case "$sub" in
+        list|ls)        cmd_forward_list ;;
+        add)            cmd_forward_add "${2:-}" ;;
+        del|rm|remove)  cmd_forward_del "${2:-}" ;;
+        replace|set)    cmd_forward_replace "${2:-}" ;;
+        apply|reapply)  cmd_forward_apply ;;
+        *)  die "Unknown forward subcommand: ${sub} (use list|add|del|replace|apply)" ;;
+    esac
+}
+
+menu_forward() {
+    local FC
+    while true; do
+        echo ""
+        hr
+        echo "  Port Forwarding"
+        hr
+        echo "  1) List forwarded ports"
+        echo "  2) Add a port"
+        echo "  3) Remove a port"
+        echo "  4) Replace the whole list"
+        echo "  5) Re-apply rules"
+        echo "  6) Back"
+        hr
+        echo ""
+        read -rp "  Choice [1-6]: " FC || true
+        echo ""
+        case "$FC" in
+            1) cmd_forward_list ;;
+            2) cmd_forward_add "" ;;
+            3) cmd_forward_del "" ;;
+            4) cmd_forward_replace "" ;;
+            5) cmd_forward_apply ;;
+            6|b|back|q) return ;;
+            *) echo "  Invalid choice." ;;
+        esac
+    done
 }
 
 # ── update ────────────────────────────────────────────────────────────────────
@@ -483,6 +807,205 @@ cmd_rollback() {
     fi
 }
 
+# ── delete tunnel ───────────────────────────────────────────────────────────
+
+# Remove the tunnel that was set up on this host without removing the tooling.
+#
+# Deleted: the systemd unit's enablement, every iptables rule the tunnel owns,
+#          the TUN device, config.yaml and tunnel.env (backed up first).
+# Kept:    the spoof-tunnel binary, spoofctl, the libexec hooks and the logs,
+#          so a new tunnel can be created straight away with 'spoofctl create'.
+#
+# Use 'spoofctl uninstall' to remove the tooling itself as well.
+
+cmd_delete() {
+    need_root
+    has_tunnel || die "No tunnel is configured on this host. Nothing to delete."
+    load_env
+
+    echo ""
+    hr
+    echo "  Delete tunnel"
+    hr
+    printf "  Role:      %s\n" "${MODE:-unknown}"
+    printf "  Peer:      %s:%s\n" "${PEER_IP:-?}" "${PEER_PORT:-2080}"
+    printf "  TUN:       %s  (%s ↔ %s)\n" \
+        "${TUN_NAME:-tun0}" "${LOCAL_TUN:-?}" "${PEER_TUN:-?}"
+    printf "  Forwarded: %s\n" "${FORWARD_PORTS:-none}"
+    printf "  Service:   %s\n" "$(svc_state)"
+    hr
+    echo ""
+    echo "  $(color_warn "The tunnel config will be removed. The binary, spoofctl and")"
+    echo "  $(color_warn "the hooks stay installed so you can create a new tunnel.")"
+    echo ""
+    read -rp "  Type 'delete' to confirm: " yn || true
+    [ "$yn" = "delete" ] || { echo "  Aborted."; return; }
+
+    echo ""
+    echo "  Stopping service..."
+    systemctl stop    "${SERVICE}" 2>/dev/null || true
+    systemctl disable "${SERVICE}" 2>/dev/null || true
+
+    # Prometheus export timer, if this tunnel enabled one.
+    if systemctl list-unit-files 2>/dev/null | grep -q '^spoof-tunnel-prom.timer'; then
+        systemctl stop    spoof-tunnel-prom.timer 2>/dev/null || true
+        systemctl disable spoof-tunnel-prom.timer 2>/dev/null || true
+        echo "  Stopped Prometheus export timer."
+    fi
+
+    echo "  Removing iptables rules..."
+    if [ -x "${FORWARD_HOOK}" ] && [ -f "${ENV_FILE}" ]; then
+        "${FORWARD_HOOK}" --remove 2>/dev/null || true
+    fi
+    drop_input_rule "${LISTEN_PORT:-}"
+
+    del_tun_device "${TUN_NAME:-tun0}"
+
+    # Back the config up before deleting it — recreating a tunnel by hand from
+    # a remembered peer IP and spoof list is exactly the mistake worth avoiding.
+    SNAP_DIR="${BACKUP_DIR}/deleted-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$SNAP_DIR"
+    [ -f "$CONF_YAML" ] && cp "$CONF_YAML" "${SNAP_DIR}/config.yaml"
+    [ -f "$ENV_FILE" ]  && cp "$ENV_FILE"  "${SNAP_DIR}/tunnel.env"
+    chmod 600 "${SNAP_DIR}"/* 2>/dev/null || true
+    echo "  Config backed up: ${SNAP_DIR}"
+
+    rm -f "$CONF_YAML" "$ENV_FILE"
+    rm -f "$HEALTH_JSON"
+
+    systemctl daemon-reload
+
+    echo ""
+    echo "  $(color_ok "Tunnel deleted.")"
+    echo ""
+    echo "  Create a new one:  spoofctl create"
+    echo "  Remove everything: spoofctl uninstall"
+}
+
+# ── create tunnel ───────────────────────────────────────────────────────────
+
+# Regenerate /etc/systemd/system/spoof-tunnel.service from tunnel.env.
+#
+# KEEP IN SYNC with the unit written by install.sh — the two must produce the
+# same file. install.sh bakes a few values into the unit at install time
+# (--spoof-ips, --json-metrics, WatchdogSec), so a tunnel created with a
+# different role or spoof list needs the unit rewritten, not just reloaded.
+regen_unit() {
+    local watchdog_line="" exec_spoof="" exec_json=""
+    [ "${WATCHDOG_SEC:-0}" -gt 0 ] && watchdog_line="WatchdogSec=${WATCHDOG_SEC}"
+    [ -n "${SPOOF_IPS:-}" ] && exec_spoof=' --spoof-ips ${SPOOF_IPS}'
+    [ "${JSON_METRICS:-false}" = "true" ] && exec_json=' --json-metrics'
+
+    cat > "${SERVICE_FILE}" << EOF
+[Unit]
+Description=spoof-tunnel-v6 IP tunnel
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/spoof-tunnel/tunnel.env
+ExecStartPre=${PREPARE_HOOK}
+ExecStart=${BIN} \\
+    --mode \${MODE} \\
+    --outer \${OUTER} \\
+    --iface \${IFACE} \\
+    --tun \${TUN_NAME} \\
+    --peer-ip \${PEER_IP} \\
+    --local-tun \${LOCAL_TUN} \\
+    --peer-tun \${PEER_TUN} \\
+    --listen-port \${LISTEN_PORT} \\
+    --peer-port \${PEER_PORT} \\
+    --mtu \${MTU} \\
+    --tx-cpu \${TX_CPU} \\
+    --rx-cpu \${RX_CPU} \\
+    --rate-mbps \${RATE_MBPS} \\
+    --flow-limit \${FLOW_LIMIT} \\
+    --batch-size \${BATCH_SIZE} \\
+    --rx-block-nr \${RX_BLOCK_NR} \\
+    --failover-loss \${FAILOVER_LOSS} \\
+    --failover-intervals \${FAILOVER_INTERVALS} \\
+    --metric-interval \${METRIC_INTERVAL} \\
+    --watchdog-sec \${WATCHDOG_SEC}${exec_spoof}${exec_json}
+ExecStartPost=${QDISC_HOOK}
+ExecStartPost=${FORWARD_HOOK}
+Restart=always
+RestartSec=2
+${watchdog_line}
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# Set up a new tunnel on a host where the tooling is already installed — the
+# other half of 'spoofctl delete'.
+cmd_create() {
+    need_root
+    toolchain_present || \
+        die "spoof-tunnel is not installed on this host. Run the installer first."
+
+    if has_tunnel; then
+        echo ""
+        echo "  $(color_warn "A tunnel is already configured on this host:")"
+        load_env
+        printf "    %s → %s:%s  (%s)\n" \
+            "${MODE:-?}" "${PEER_IP:-?}" "${PEER_PORT:-?}" "$(svc_state)"
+        echo ""
+        echo "  Delete it first with 'spoofctl delete', or change it in place"
+        echo "  with 'spoofctl edit-config'."
+        return 1
+    fi
+
+    [ -x "$WIZARD" ] || die "Setup wizard not found at ${WIZARD}.
+       It ships with the installer — run 'spoofctl update' to pull it in,
+       or write ${CONF_YAML} by hand and run 'spoofctl create' again."
+
+    mkdir -p "$CONF_DIR"
+
+    echo ""
+    echo "  Starting the setup wizard..."
+    echo ""
+    bash "$WIZARD" --output "$CONF_YAML"
+    [ -f "$CONF_YAML" ] || die "Wizard did not produce ${CONF_YAML}. Aborted."
+    chmod 640 "$CONF_YAML"
+
+    echo ""
+    echo "  Validating config..."
+    python3 "${LIB_DIR}/config-parse.py" --validate "$CONF_YAML" \
+        || die "config.yaml failed validation. Fix it with 'spoofctl edit-config'."
+
+    python3 "${LIB_DIR}/config-parse.py" --output "$ENV_FILE" "$CONF_YAML"
+    chmod 640 "$ENV_FILE"
+
+    echo "  Writing service unit..."
+    load_env
+    regen_unit
+    systemctl daemon-reload
+
+    echo "  Enabling and starting service..."
+    systemctl enable "${SERVICE}" >/dev/null 2>&1 || true
+    systemctl start  "${SERVICE}"
+    sleep 3
+
+    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
+        echo ""
+        echo "  $(color_ok "Tunnel created and running.")"
+        cmd_status
+    else
+        echo ""
+        echo "  $(color_err "Service failed to start.")"
+        journalctl -u "${SERVICE}" -n 30 --no-pager >&2
+        exit 1
+    fi
+}
+
 # ── uninstall ────────────────────────────────────────────────────────────────
 
 cmd_uninstall() {
@@ -499,10 +1022,21 @@ cmd_uninstall() {
     systemctl stop    "${SERVICE}" 2>/dev/null || true
     systemctl disable "${SERVICE}" 2>/dev/null || true
 
-    echo "  Removing iptables forwarding rules..."
-    if [ -f "/usr/local/libexec/spoof-tunnel-forward" ] && [ -f "${ENV_FILE}" ]; then
-        /usr/local/libexec/spoof-tunnel-forward --remove 2>/dev/null || true
+    # Load the env before deleting it so the teardown knows the port and TUN name.
+    load_env
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^spoof-tunnel-prom.timer'; then
+        systemctl stop    spoof-tunnel-prom.timer 2>/dev/null || true
+        systemctl disable spoof-tunnel-prom.timer 2>/dev/null || true
     fi
+
+    echo "  Removing iptables rules..."
+    if [ -f "${FORWARD_HOOK}" ] && [ -f "${ENV_FILE}" ]; then
+        "${FORWARD_HOOK}" --remove 2>/dev/null || true
+    fi
+    drop_input_rule "${LISTEN_PORT:-}"
+
+    del_tun_device "${TUN_NAME:-tun0}"
 
     echo "  Removing files..."
     rm -f "/etc/systemd/system/${SERVICE}.service"
@@ -560,11 +1094,13 @@ show_menu() {
     echo "  4) Restart"
     echo "  5) Edit Config"
     echo "  6) Change Spoof IPs"
-    echo "  7) Forwarding Rules"
-    echo "  8) Update"
-    echo "  9) Rollback"
-    echo " 10) Uninstall"
-    echo " 11) Exit"
+    echo "  7) Port Forwarding..."
+    echo "  8) Create Tunnel"
+    echo "  9) Delete Tunnel"
+    echo " 10) Update"
+    echo " 11) Rollback"
+    echo " 12) Uninstall"
+    echo " 13) Exit"
     hr
     echo ""
 }
@@ -572,7 +1108,7 @@ show_menu() {
 interactive_menu() {
     while true; do
         show_menu
-        read -rp "  Choice [1-11]: " CHOICE || true
+        read -rp "  Choice [1-13]: " CHOICE || true
         echo ""
         case "$CHOICE" in
             1)  cmd_status ;;
@@ -581,11 +1117,13 @@ interactive_menu() {
             4)  cmd_restart ;;
             5)  cmd_edit_config ;;
             6)  cmd_spoof_ips ;;
-            7)  cmd_forward_rules ;;
-            8)  cmd_update ;;
-            9)  cmd_rollback ;;
-            10) cmd_uninstall; break ;;
-            11|q|quit|exit) echo "  Bye."; break ;;
+            7)  menu_forward ;;
+            8)  cmd_create || true ;;   # a refusal must not kill the menu
+            9)  cmd_delete ;;
+            10) cmd_update ;;
+            11) cmd_rollback ;;
+            12) cmd_uninstall; break ;;
+            13|q|quit|exit) echo "  Bye."; break ;;
             *)  echo "  Invalid choice." ;;
         esac
         echo ""
@@ -596,6 +1134,7 @@ interactive_menu() {
 # ── entry point ──────────────────────────────────────────────────────────────
 
 CMD="${1:-}"
+shift || true
 
 case "$CMD" in
     "")              interactive_menu ;;
@@ -605,7 +1144,10 @@ case "$CMD" in
     restart)         cmd_restart ;;
     edit-config)     cmd_edit_config ;;
     spoof-ips)       cmd_spoof_ips ;;
-    forward-rules)   cmd_forward_rules ;;
+    forward)         cmd_forward "$@" ;;
+    forward-rules)   cmd_forward replace "${1:-}" ;;
+    create)          cmd_create ;;
+    delete)          cmd_delete ;;
     update)          cmd_update ;;
     rollback)        cmd_rollback ;;
     uninstall)       cmd_uninstall ;;
@@ -618,10 +1160,18 @@ case "$CMD" in
         echo "  restart         Restart the service"
         echo "  edit-config     Open config.yaml in \$EDITOR"
         echo "  spoof-ips       Update the spoof IP list"
-        echo "  forward-rules   Update port forwarding rules (client nodes only)"
+        echo "  create          Set up a new tunnel with the setup wizard"
+        echo "  delete          Remove the configured tunnel (keeps the tooling)"
         echo "  update          Download and install the latest release"
         echo "  rollback        Restore a previous snapshot"
         echo "  uninstall       Remove spoof-tunnel from this system"
+        echo ""
+        echo "Port forwarding (client nodes only):"
+        echo "  forward list            Show configured ports and live iptables rules"
+        echo "  forward add PORT[,...]  Add port(s), keeping the existing ones"
+        echo "  forward del PORT[,...]  Remove port(s); 'all' removes every rule"
+        echo "  forward replace LIST    Replace the whole list (alias: forward-rules)"
+        echo "  forward apply           Re-install the rules for the configured list"
         echo ""
         echo "With no command, shows the interactive menu."
         ;;

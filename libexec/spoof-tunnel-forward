@@ -2,8 +2,10 @@
 # spoof-tunnel-forward — install / remove iptables port-forwarding rules
 #
 # Usage:
-#   spoof-tunnel-forward            install rules  (ExecStartPost)
-#   spoof-tunnel-forward --remove   remove rules   (called by uninstall)
+#   spoof-tunnel-forward                   install rules  (ExecStartPost)
+#   spoof-tunnel-forward --remove          remove every rule (uninstall/delete)
+#   spoof-tunnel-forward --remove-port N   remove only the DNAT rules for port N
+#                                          (used by 'spoofctl forward del N')
 #
 # ── What this script does ────────────────────────────────────────────────────
 #
@@ -46,6 +48,7 @@
 set -euo pipefail
 
 ACTION="${1:-install}"
+ARG_PORT="${2:-}"
 source /etc/spoof-tunnel/tunnel.env
 
 [ "${MODE:-}" = "client" ] || exit 0
@@ -53,6 +56,30 @@ source /etc/spoof-tunnel/tunnel.env
 TUN="${TUN_NAME:-tun0}"
 PEER_TUN_IP="${PEER_TUN:-10.100.100.1}"
 PHYS="${IFACE:-eth0}"
+
+# ── remove-port mode ────────────────────────────────────────────
+#
+# Removes the TCP+UDP DNAT rules for one port only. The shared FORWARD and
+# MASQUERADE rules are left in place because other forwarded ports still need
+# them; 'spoofctl forward del' calls '--remove' instead when it removes the
+# last port.
+
+if [ "$ACTION" = "--remove-port" ]; then
+    [ -n "$ARG_PORT" ] || { echo "spoof-tunnel-forward: --remove-port needs a port" >&2; exit 1; }
+    removed=0
+    for proto in tcp udp; do
+        while iptables -t nat -C PREROUTING                 -p "$proto" --dport "$ARG_PORT"                 -j DNAT --to-destination "${PEER_TUN_IP}:${ARG_PORT}" 2>/dev/null; do
+            iptables -t nat -D PREROUTING                 -p "$proto" --dport "$ARG_PORT"                 -j DNAT --to-destination "${PEER_TUN_IP}:${ARG_PORT}"
+            removed=$(( removed + 1 ))
+        done
+    done
+    if [ "$removed" -gt 0 ]; then
+        echo "spoof-tunnel-forward: removed ${removed} DNAT rule(s) for port ${ARG_PORT}"
+    else
+        echo "spoof-tunnel-forward: no DNAT rules found for port ${ARG_PORT}"
+    fi
+    exit 0
+fi
 
 # ── remove mode ───────────────────────────────────────────────────────────────
 

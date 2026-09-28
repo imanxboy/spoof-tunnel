@@ -288,15 +288,20 @@ on the TUN IP (10.100.100.1) on the server.
 
 **Re-apply all forwarding rules without a service restart:**
 ```bash
-spoofctl forward-rules
+spoofctl forward apply
 # or:
 /usr/local/libexec/spoof-tunnel-forward --remove && /usr/local/libexec/spoof-tunnel-forward
 ```
 
 **Check current forwarding configuration and NAT state:**
 ```bash
-spoofctl status   # shows forwarded ports and live DNAT/MASQUERADE/FORWARD counts
+spoofctl forward list   # per-port: configured vs. actually installed in iptables
+spoofctl status         # forwarded ports and live DNAT/MASQUERADE/FORWARD counts
 ```
+
+`forward list` marks a port `configured, rule missing` when it is in
+`FORWARD_PORTS` but its DNAT rule is not in iptables — the usual symptom of
+another tool flushing the nat table. `spoofctl forward apply` puts them back.
 
 ---
 

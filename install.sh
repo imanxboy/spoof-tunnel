@@ -137,6 +137,11 @@ install -m 755 -o root -g root \
 install -m 755 -o root -g root \
     "${PACKAGE_DIR}/healthcheck.sh" \
     "${LIB_DIR}/healthcheck.sh"
+# Kept on the host so 'spoofctl create' can build a new tunnel after
+# 'spoofctl delete' without re-downloading the release.
+install -m 755 -o root -g root \
+    "${PACKAGE_DIR}/scripts/setup-wizard.sh" \
+    "${LIB_DIR}/setup-wizard.sh"
 
 # ── config.yaml (never overwrite existing) ──────────────────────────────────
 
@@ -175,6 +180,8 @@ WATCHDOG_LINE=""
 [ "${WATCHDOG_SEC:-0}" -gt 0 ] && WATCHDOG_LINE="WatchdogSec=${WATCHDOG_SEC}"
 
 # Build optional ExecStart flags at install time.
+# KEEP IN SYNC with regen_unit() in scripts/spoofctl, which rewrites this
+# same unit when 'spoofctl create' sets up a tunnel on an installed host.
 # These values come from tunnel.env (already sourced above).
 # EXEC_SPOOF and EXEC_JSON contain literal ${...} text for systemd runtime expansion.
 EXEC_SPOOF=''

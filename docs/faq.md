@@ -149,10 +149,16 @@ the tunnel instead of directly to the user's real IP.
 All rules are automatically restored on every service start (ExecStartPost)
 and removed cleanly on uninstall.
 
-To update forwarding ports after installation:
+To change forwarding ports after installation:
 ```bash
-spoofctl forward-rules
+spoofctl forward list          # what is configured, and what is live
+spoofctl forward add 8443      # add one port, keep the rest
+spoofctl forward del 8443      # remove one port ('all' clears everything)
+spoofctl forward replace 443,80  # replace the whole list
 ```
+
+Changes apply to iptables immediately and are written to both `tunnel.env`
+and `config.yaml`, so they survive a reinstall. No service restart needed.
 
 ---
 
@@ -193,14 +199,36 @@ spoofctl rollback
 This shows available snapshots (taken before each update) and restores
 the selected one.
 
+### How do I delete the tunnel but keep the tooling?
+
+```bash
+spoofctl delete
+```
+
+This stops and disables the service, removes every iptables rule the tunnel
+owns (forwarding DNAT/FORWARD/MASQUERADE plus the `INPUT ... -j DROP` rule on
+the outer UDP port), deletes the TUN device, and removes `config.yaml` and
+`tunnel.env` after backing them up to
+`/var/backups/spoof-tunnel/deleted-<timestamp>/`.
+
+The binary, `spoofctl` and the hooks stay installed, so you can set up a
+different tunnel right away:
+
+```bash
+spoofctl create
+```
+
+`create` runs the same setup wizard used at install time, regenerates the
+systemd unit from the new config, and starts the service.
+
 ### How do I uninstall?
 
 ```bash
 spoofctl uninstall
 ```
 
-This stops and disables the service, removes all installed files, and
-optionally removes config and logs.
+This stops and disables the service, removes every iptables rule and the TUN
+device, removes all installed files, and optionally removes config and logs.
 
 ---
 
