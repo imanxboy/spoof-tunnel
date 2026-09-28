@@ -932,14 +932,21 @@ remove_instance_dropin() {
 # UDP port. Nothing else removes it, so 'delete' and 'uninstall' both call this
 # — otherwise the port stays black-holed after the tunnel is gone.
 drop_input_rule() {
-    local port="${1:-}"
+    local port="${1:-}" iface="${2:-}"
     [ -n "$port" ] || return 0
     local n=0
+    # Scoped form (current) and unscoped form (written by earlier versions).
+    if [ -n "$iface" ]; then
+        while iptables -C INPUT -i "$iface" -p udp --dport "$port" -j DROP 2>/dev/null; do
+            iptables -D INPUT -i "$iface" -p udp --dport "$port" -j DROP
+            n=$(( n + 1 ))
+        done
+    fi
     while iptables -C INPUT -p udp --dport "$port" -j DROP 2>/dev/null; do
         iptables -D INPUT -p udp --dport "$port" -j DROP
         n=$(( n + 1 ))
     done
-    [ "$n" -gt 0 ] && echo "  Removed INPUT DROP rule for udp/${port}."
+    [ "$n" -gt 0 ] && echo "  Removed ${n} INPUT DROP rule(s) for udp/${port}."
     return 0
 }
 
@@ -1011,7 +1018,7 @@ cmd_delete() {
     if [ -x "${FORWARD_HOOK}" ] && [ -f "${TENV}" ]; then
         "${FORWARD_HOOK}" --remove $(hook_arg) 2>/dev/null || true
     fi
-    drop_input_rule "${LISTEN_PORT:-}"
+    drop_input_rule "${LISTEN_PORT:-}" "${IFACE:-}"
 
     del_tun_device "${TUN_NAME:-}"
 
@@ -1456,7 +1463,7 @@ cmd_uninstall() {
             if [ -x "$FORWARD_HOOK" ]; then
                 "$FORWARD_HOOK" --remove $inst 2>/dev/null || true
             fi
-            drop_input_rule "$(env_get "$env" LISTEN_PORT)"
+            drop_input_rule "$(env_get "$env" LISTEN_PORT)" "$(env_get "$env" IFACE)"
             del_tun_device  "$(env_get "$env" TUN_NAME)"
         fi
     }

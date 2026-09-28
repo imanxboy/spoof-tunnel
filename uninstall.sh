@@ -26,7 +26,7 @@ env_get() {
 # it owns. This has to happen before the env files are deleted, because that
 # is where the port and TUN device names come from.
 teardown() {
-    local unit="$1" env_file="$2" inst="$3" port tun
+    local unit="$1" env_file="$2" inst="$3" port tun iface
 
     echo "  Stopping ${unit}..."
     systemctl stop    "$unit" 2>/dev/null || true
@@ -41,7 +41,14 @@ teardown() {
     # The INPUT DROP rule installed by spoof-tunnel-prepare for the outer UDP
     # port. Nothing else removes it, so the port would stay black-holed.
     port="$(env_get "$env_file" LISTEN_PORT)"
+    iface="$(env_get "$env_file" IFACE)"
     if [ "$(env_get "$env_file" OUTER)" != "tcp" ] && [ -n "$port" ]; then
+        # Scoped form (current) and unscoped form (earlier versions).
+        if [ -n "$iface" ]; then
+            while iptables -C INPUT -i "$iface" -p udp --dport "$port" -j DROP 2>/dev/null; do
+                iptables -D INPUT -i "$iface" -p udp --dport "$port" -j DROP
+            done
+        fi
         while iptables -C INPUT -p udp --dport "$port" -j DROP 2>/dev/null; do
             iptables -D INPUT -p udp --dport "$port" -j DROP
         done

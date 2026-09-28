@@ -35,10 +35,22 @@ sysctl -qw "net.ipv4.conf.all.rp_filter=0"         2>/dev/null || true
 # replies. AF_PACKET intercepts the raw frame before the kernel processes it,
 # but without this rule the kernel also tries to deliver the packet to a UDP
 # socket, fails, and generates unwanted ICMP traffic back to the peer.
+#
+# Scoped to the outer physical interface. Tunnel frames only ever arrive
+# there, and an unscoped rule also matches the TUN device: when a forwarded
+# port equals the tunnel's own listen port, the unscoped form drops the UDP
+# traffic the tunnel just delivered through tun0 to the overlay service.
 if [ "${OUTER:-udp}" = "udp" ]; then
-    if ! iptables -C INPUT -p udp --dport "${LISTEN_PORT}" -j DROP 2>/dev/null; then
-        iptables -I INPUT -p udp --dport "${LISTEN_PORT}" -j DROP
+    if ! iptables -C INPUT -i "${IFACE}" -p udp \
+            --dport "${LISTEN_PORT}" -j DROP 2>/dev/null; then
+        iptables -I INPUT -i "${IFACE}" -p udp --dport "${LISTEN_PORT}" -j DROP
     fi
+    # Remove the unscoped rule left by earlier versions, which would keep
+    # swallowing tunnel-delivered traffic on the same port number.
+    while iptables -C INPUT -p udp --dport "${LISTEN_PORT}" -j DROP 2>/dev/null; do
+        iptables -D INPUT -p udp --dport "${LISTEN_PORT}" -j DROP
+        echo "spoof-tunnel-prepare: removed unscoped INPUT DROP for udp/${LISTEN_PORT}"
+    done
 fi
 
 # ip_forward is required for the TUN interface to forward packets between the
