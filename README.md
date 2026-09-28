@@ -74,25 +74,50 @@ curl -fsSL https://raw.githubusercontent.com/imanxboy/spoof-tunnel/main/scripts/
 The installer:
 1. Detects your OS and installs dependencies (`gcc`, `python3`, etc.)
 2. Downloads and compiles the latest release
-3. Launches the **interactive setup wizard** if no config exists
-4. Installs the service and starts it
+3. Installs the binary, the hooks and `spoofctl`
 
-Run on the **server** first, then on the **client**.
+**It does not create a tunnel.** Installing never asks for an address, never
+writes a tunnel config and never starts anything — a freshly installed host
+has no tunnel at all. No address of any kind ships in this repository.
+
+### Create the tunnel
+
+Run this on **both** machines. It asks for the peer address, the spoof IPs and
+the ports:
+
+```bash
+sudo spoofctl create main
+```
+
+One end is the **client** (your front-end, where users connect) and the other
+is the **server** (the foreign machine running Xray/VLESS). Create the server
+end first, so the client has an address to point at.
+
+```bash
+spoofctl list            # what exists on this host
+spoofctl status main     # service state, traffic, forwarding rules
+```
 
 ### Manual install
 
 ```bash
 git clone https://github.com/imanxboy/spoof-tunnel
 cd spoof-tunnel
-sudo bash scripts/setup-wizard.sh   # creates config.yaml
-sudo bash install.sh                # builds, installs, starts service
+sudo bash install.sh            # builds and installs the tools only
+sudo spoofctl create main       # then create a tunnel
 ```
+
+To install from a config file you wrote yourself instead of using the wizard,
+put it next to `install.sh` as `config.yaml` and run `sudo bash install.sh` —
+that path installs the single-tunnel layout and is kept for upgrading hosts
+that predate named tunnels.
 
 ---
 
 ## Configuration
 
-The wizard writes `config.yaml`. The key fields:
+`spoofctl create` writes the tunnel's config through the wizard. The key
+fields:
 
 ```yaml
 tunnel:
@@ -226,8 +251,7 @@ spoofctl [command]
 | `create [NAME]` | Set up a new tunnel with the wizard |
 | `delete [NAME]` | Remove one tunnel, keeping the tooling and the others |
 | `migrate [NAME]` | Convert a single-tunnel host to the named layout |
-| `update` | Download and install the latest release (auto-rollback on failure) |
-| `rollback` | Restore a previous snapshot |
+| `update` | Download and install the latest release |
 | `uninstall` | Remove everything from this system |
 
 `forward-rules` is kept as an alias for `forward replace`.
@@ -330,10 +354,14 @@ With no arguments, `spoofctl` opens an interactive numbered menu.
 spoofctl update
 ```
 
-or:
+This replaces the tooling and restarts every tunnel on the host. Your tunnel
+configs are not touched.
+
+To install a specific release instead — which is also how you go back if a
+release turns out to be bad, since only the tooling is replaced:
 
 ```bash
-sudo INSTALL_TAG=v6.1.0 bash scripts/install.sh
+INSTALL_TAG=v6.3.0 curl -fsSL     https://raw.githubusercontent.com/imanxboy/spoof-tunnel/main/scripts/install.sh     | sudo bash
 ```
 
 ---
@@ -341,9 +369,9 @@ sudo INSTALL_TAG=v6.1.0 bash scripts/install.sh
 ## Monitoring
 
 ```bash
-journalctl -u spoof-tunnel -f          # live logs
-cat /run/spoof-tunnel/health.json      # JSON metrics (tx_pps, rx_pps, loss_pct)
-/usr/local/lib/spoof-tunnel/status.sh  # human-readable status
+journalctl -u spoof-tunnel@NAME -f            # live logs for one tunnel
+cat /run/spoof-tunnel/NAME/health.json        # JSON metrics (tx_pps, rx_pps, loss_pct)
+spoofctl status NAME                          # human-readable status
 ```
 
 Health JSON is written every `metric_interval` seconds (default: 5s). The

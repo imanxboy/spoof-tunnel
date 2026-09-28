@@ -121,7 +121,7 @@ fi
 if [ -z "$TAG" ]; then
     die "Could not determine release tag. Ensure a release has been published at:
        ${API_BASE}/releases/latest
-  If no releases exist yet, create one via: git tag v6.2.1 && git push --tags"
+  If no releases exist yet, create one via: git tag v6.3.0 && git push --tags"
 fi
 log "Installing version: ${TAG}"
 
@@ -146,28 +146,29 @@ bash "${PKG_DIR}/build.sh"
 [ -f "${PKG_DIR}/bin/spoof-tunnel" ] || die "Build failed — no binary produced."
 log "Build complete."
 
-# ── setup wizard (if no existing config) ─────────────────────────────────────
+# ── run package installer ─────────────────────────────────────────────────────
+#
+# Installing only puts the tools on the host. It does not ask for addresses,
+# write a tunnel config, or start anything — a freshly installed host has no
+# tunnel at all. Tunnels are created afterwards with `spoofctl create`, which
+# is where the operator enters the peer address and spoof IPs.
+#
+# A host that already has a tunnel from an earlier version keeps it: install.sh
+# installs the single-tunnel layout only when /etc/spoof-tunnel/config.yaml
+# already exists, and leaves the service alone here.
 
 mkdir -p "${CONF_DIR}"
 
-if [ ! -f "${CONF_YAML}" ]; then
-    log "No existing configuration found — launching setup wizard."
-    echo ""
-    # Redirect stdin from /dev/tty so the wizard reads keystrokes even when
-    # this script itself was piped in via "curl | bash" (stdin would be EOF).
-    bash "${PKG_DIR}/scripts/setup-wizard.sh" --output "${PKG_DIR}/config.yaml" </dev/tty
-    cp -f "${PKG_DIR}/config.yaml" "${CONF_YAML}"
-    echo ""
-    log "Config saved to ${CONF_YAML}"
-else
-    log "Existing config found at ${CONF_YAML} — skipping wizard."
+if [ -f "${CONF_YAML}" ]; then
+    log "Existing tunnel found at ${CONF_YAML} — upgrading it in place."
     cp -f "${CONF_YAML}" "${PKG_DIR}/config.yaml"
+    bash "${PKG_DIR}/install.sh" --no-start
+    HAD_CONFIG=1
+else
+    log "Installing tools..."
+    bash "${PKG_DIR}/install.sh" --tooling-only
+    HAD_CONFIG=0
 fi
-
-# ── run package installer ─────────────────────────────────────────────────────
-
-log "Running installer..."
-bash "${PKG_DIR}/install.sh"
 
 # ── store version + update config ────────────────────────────────────────────
 
@@ -192,8 +193,22 @@ echo "  │          Installation complete!                  │"
 echo "  └──────────────────────────────────────────────────┘"
 echo ""
 echo "  Version:   ${TAG}"
-echo "  Config:    ${CONF_YAML}"
-echo "  Service:   systemctl status spoof-tunnel"
-echo "  Logs:      journalctl -u spoof-tunnel -f"
-echo "  Manage:    spoofctl"
-echo ""
+if [ "${HAD_CONFIG}" = "1" ]; then
+    echo "  Config:    ${CONF_YAML}"
+    echo "  Service:   systemctl status spoof-tunnel"
+    echo "  Logs:      journalctl -u spoof-tunnel -f"
+    echo "  Manage:    spoofctl"
+    echo ""
+else
+    echo ""
+    echo "  No tunnel exists yet. Create one — it will ask for the peer"
+    echo "  address, the spoof IPs and the ports:"
+    echo ""
+    echo "      spoofctl create <name>"
+    echo ""
+    echo "  Run this on BOTH machines. One end is the client (the front-end,"
+    echo "  where users connect), the other is the server."
+    echo ""
+    echo "  Then:  spoofctl list     spoofctl status <name>"
+    echo ""
+fi

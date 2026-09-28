@@ -187,17 +187,15 @@ journalctl -u spoof-tunnel -f
 spoofctl update
 ```
 
-This downloads the latest release, rebuilds, installs, restarts, and
-automatically rolls back if the health check fails after restart.
+This downloads the latest release, rebuilds, installs and restarts every
+tunnel on the host. Your configs are not touched.
 
-### How do I roll back to the previous version?
+If a release turns out to be bad, reinstall a known-good tag — your tunnel
+configs survive it, because the installer only replaces the tooling:
 
 ```bash
-spoofctl rollback
+INSTALL_TAG=v6.2.1 curl -fsSL https://raw.githubusercontent.com/imanxboy/spoof-tunnel/main/scripts/install.sh | sudo bash
 ```
-
-This shows available snapshots (taken before each update) and restores
-the selected one.
 
 ### Can one host run more than one tunnel?
 

@@ -61,18 +61,37 @@ curl -fsSL https://raw.githubusercontent.com/imanxboy/spoof-tunnel/main/scripts/
 نصب‌کننده:
 ۱. وابستگی‌های سیستم را نصب می‌کند (`gcc`، `python3` و غیره)
 ۲. آخرین نسخه را دانلود و کامپایل می‌کند
-۳. اگر config وجود نداشته باشد، **ویزارد تنظیمات** را اجرا می‌کند
-۴. سرویس را نصب و راه‌اندازی می‌کند
+۳. باینری، هوک‌ها و `spoofctl` را نصب می‌کند
 
-**ابتدا روی سرور خارجی نصب کنید، سپس روی کلاینت داخلی.**
+**تانل نمی‌سازد.** نصب هیچ آدرسی نمی‌پرسد، هیچ کانفیگ تانلی نمی‌نویسد و
+هیچ سرویسی را استارت نمی‌زند — هاست تازه‌نصب‌شده اصلاً تانل ندارد. هیچ آدرسی
+هم در این ریپازیتوری وجود ندارد.
+
+### ساخت تانل
+
+این را روی **هر دو** ماشین اجرا کن. آدرس peer، IP‌های spoof و پورت‌ها را از
+تو می‌پرسد:
+
+```bash
+sudo spoofctl create main
+```
+
+یک طرف **client** است (سرور جلویی، جایی که کاربرها وصل می‌شوند) و طرف دیگر
+**server** (ماشین خارجی که Xray/VLESS روی آن است). اول سمت سرور را بساز تا
+کلاینت آدرسی برای اشاره‌کردن داشته باشد.
+
+```bash
+spoofctl list            # چه چیزی روی این هاست هست
+spoofctl status main     # وضعیت سرویس، ترافیک، قوانین فوروارد
+```
 
 ### نصب دستی
 
 ```bash
 git clone https://github.com/imanxboy/spoof-tunnel
 cd spoof-tunnel
-sudo bash scripts/setup-wizard.sh   # ایجاد config.yaml
-sudo bash install.sh                # ساخت، نصب، و راه‌اندازی سرویس
+sudo bash install.sh            # فقط ابزارها را می‌سازد و نصب می‌کند
+sudo spoofctl create main       # بعد تانل را بساز
 ```
 
 ---
@@ -208,8 +227,7 @@ spoofctl [دستور]
 | `create [NAME]` | ساخت تانل جدید با ویزارد |
 | `delete [NAME]` | حذف یک تانل، بدون دست‌زدن به بقیه و به خود اسکریپت |
 | `migrate [NAME]` | تبدیل هاست تک‌تانله به ساختار نام‌دار |
-| `update` | دانلود و نصب آخرین نسخه (با rollback خودکار در صورت خطا) |
-| `rollback` | بازگشت به نسخه قبلی |
+| `update` | دانلود و نصب آخرین نسخه |
 | `uninstall` | حذف کامل از سیستم |
 
 `forward-rules` به‌عنوان نام مستعار `forward replace` باقی مانده است.
@@ -320,9 +338,8 @@ spoofctl migrate        # به‌صورت پیش‌فرض اسمش را 'main' �
   11) Delete Tunnel
   12) Migrate to multi-tunnel layout
   13) Update
-  14) Rollback
-  15) Uninstall
-  16) Exit
+  14) Uninstall
+  15) Exit
 ```
 
 ---
@@ -336,7 +353,9 @@ spoofctl update
 یا با نسخه مشخص:
 
 ```bash
-sudo INSTALL_TAG=v6.1.0 bash scripts/install.sh
+INSTALL_TAG=v6.3.0 curl -fsSL \
+    https://raw.githubusercontent.com/imanxboy/spoof-tunnel/main/scripts/install.sh \
+    | sudo bash
 ```
 
 ---
@@ -344,9 +363,9 @@ sudo INSTALL_TAG=v6.1.0 bash scripts/install.sh
 ## مانیتورینگ
 
 ```bash
-journalctl -u spoof-tunnel -f          # لاگ زنده
-cat /run/spoof-tunnel/health.json      # متریک‌های JSON
-/usr/local/lib/spoof-tunnel/status.sh  # وضعیت قابل خواندن
+journalctl -u spoof-tunnel@NAME -f            # لاگ زنده‌ی یک تانل
+cat /run/spoof-tunnel/NAME/health.json        # متریک‌های JSON
+spoofctl status NAME                          # وضعیت قابل خواندن
 ```
 
 متریک‌های `health.json`:

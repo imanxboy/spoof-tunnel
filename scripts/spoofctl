@@ -4,7 +4,7 @@
 # Usage: spoofctl [command] [tunnel] [-t tunnel]
 #   Commands: list status start stop restart edit-config spoof-ips
 #             forward list|add|del|replace|apply   (alias: forward-rules)
-#             create delete migrate update rollback uninstall
+#             create delete migrate update uninstall
 #   No command → interactive menu
 #
 # ── Host layouts ─────────────────────────────────────────────────────────────
@@ -1339,22 +1339,6 @@ cmd_update() {
 
     local MODE_NOW; MODE_NOW="$(host_mode)"
 
-    # Snapshot: the binary, every tunnel's config and env, and the unit files.
-    echo ""
-    echo "  Creating rollback snapshot..."
-    local SNAP_DIR="${BACKUP_DIR}/pre-update-${TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
-    mkdir -p "${SNAP_DIR}"
-    [ -f "$BIN" ] && cp "$BIN" "${SNAP_DIR}/spoof-tunnel"
-    [ -f "$LEGACY_YAML" ]        && cp "$LEGACY_YAML"        "${SNAP_DIR}/config.yaml"
-    [ -f "$LEGACY_ENV" ]         && cp "$LEGACY_ENV"         "${SNAP_DIR}/tunnel.env"
-    [ -f "$LEGACY_UNIT_FILE" ]   && cp "$LEGACY_UNIT_FILE"   "${SNAP_DIR}/spoof-tunnel.service"
-    [ -f "$TEMPLATE_UNIT_FILE" ] && cp "$TEMPLATE_UNIT_FILE" "${SNAP_DIR}/spoof-tunnel@.service"
-    if [ -d "$TUNNELS_DIR" ]; then
-        mkdir -p "${SNAP_DIR}/tunnels"
-        cp "$TUNNELS_DIR"/* "${SNAP_DIR}/tunnels/" 2>/dev/null || true
-    fi
-    echo "  Snapshot saved: ${SNAP_DIR}"
-
     local WORK_DIR; WORK_DIR=$(mktemp -d)
     trap 'rm -rf "${WORK_DIR}"' EXIT
     echo "  Downloading ${TAG}..."
@@ -1435,133 +1419,16 @@ cmd_update() {
         return
     fi
 
-    # Auto-rollback: restore the previous binary and unit files, restart.
-    echo "  $(color_err "Failed after update: ${failed} — rolling back...")"
-    [ -f "${SNAP_DIR}/spoof-tunnel" ] && cp -f "${SNAP_DIR}/spoof-tunnel" "$BIN"
-    [ -f "${SNAP_DIR}/spoof-tunnel.service" ] && \
-        cp -f "${SNAP_DIR}/spoof-tunnel.service" "$LEGACY_UNIT_FILE"
-    [ -f "${SNAP_DIR}/spoof-tunnel@.service" ] && \
-        cp -f "${SNAP_DIR}/spoof-tunnel@.service" "$TEMPLATE_UNIT_FILE"
-    systemctl daemon-reload
-
-    local still=""
+    echo "  $(color_err "Failed to start after update: ${failed}")"
+    echo ""
+    echo "  The previous binary is at ${BIN}.bak."
+    echo "  To go back to a known-good release:"
+    echo "      INSTALL_TAG=<tag> curl -fsSL ${REPO_URL}/raw/main/scripts/install.sh | sudo bash"
+    echo ""
     if [ "$MODE_NOW" = "legacy" ]; then
-        systemctl restart spoof-tunnel 2>/dev/null || true
-        sleep 2
-        systemctl is-active spoof-tunnel >/dev/null 2>&1 || still="spoof-tunnel"
-    else
-        local m
-        while IFS= read -r m; do
-            [ -z "$m" ] && continue
-            systemctl restart "spoof-tunnel@${m}" 2>/dev/null || true
-            sleep 2
-            systemctl is-active "spoof-tunnel@${m}" >/dev/null 2>&1 || \
-                still="${still:+$still }spoof-tunnel@${m}"
-        done < <(tunnel_names)
-    fi
-
-    if [ -z "$still" ]; then
-        echo "  $(color_warn "Rolled back to the previous version. Services are running.")"
-    else
-        echo "  $(color_err "Rollback also failed for: ${still}")"
-        echo "  $(color_err "Snapshot: ${SNAP_DIR}")"
+        journalctl -u spoof-tunnel -n 30 --no-pager >&2
     fi
     exit 1
-}
-
-# ── rollback ─────────────────────────────────────────────────────────────────
-
-cmd_rollback() {
-    need_root
-
-    [ -d "$BACKUP_DIR" ] || die "No backup directory found: ${BACKUP_DIR}"
-
-    echo ""
-    echo "  Available rollback snapshots:"
-    echo ""
-    local -a SNAPS=()
-    local i=1 d
-    while IFS= read -r d; do
-        SNAPS+=("$d")
-        printf "    %2d) %s\n" "$i" "$(basename "$d")"
-        i=$(( i + 1 ))
-    done < <(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d | sort -r)
-
-    [ "${#SNAPS[@]}" -eq 0 ] && die "No snapshots found in ${BACKUP_DIR}."
-
-    echo ""
-    local IDX
-    read -rp "  Select snapshot [1]: " IDX || true
-    IDX="${IDX:-1}"
-    [[ "$IDX" =~ ^[0-9]+$ ]] || die "Invalid selection."
-    [ "$IDX" -ge 1 ] && [ "$IDX" -le "${#SNAPS[@]}" ] || die "Out of range."
-    local SNAP="${SNAPS[$((IDX-1))]}"
-
-    echo ""
-    echo "  Will restore from: $(basename "$SNAP")"
-    read -rp "  Confirm? [y/N] " yn || true
-    case "${yn,,}" in y|yes) ;; *) echo "Aborted."; return ;; esac
-
-    local MODE_NOW; MODE_NOW="$(host_mode)"
-
-    echo "  Stopping services..."
-    if [ "$MODE_NOW" = "legacy" ]; then
-        systemctl stop spoof-tunnel 2>/dev/null || true
-    else
-        local n
-        while IFS= read -r n; do
-            [ -n "$n" ] && systemctl stop "spoof-tunnel@${n}" 2>/dev/null || true
-        done < <(tunnel_names)
-    fi
-
-    if [ -f "${SNAP}/spoof-tunnel" ]; then
-        install -m 755 "${SNAP}/spoof-tunnel" "$BIN"
-        echo "  Binary restored."
-    fi
-
-    if [ -f "${SNAP}/config.yaml" ] || [ -d "${SNAP}/tunnels" ]; then
-        read -rp "  Restore configs too? [y/N] " yn2 || true
-        case "${yn2,,}" in
-            y|yes)
-                [ -f "${SNAP}/config.yaml" ] && cp -f "${SNAP}/config.yaml" "$LEGACY_YAML"
-                [ -f "${SNAP}/tunnel.env" ]  && cp -f "${SNAP}/tunnel.env"  "$LEGACY_ENV"
-                if [ -d "${SNAP}/tunnels" ]; then
-                    mkdir -p "$TUNNELS_DIR"
-                    cp -f "${SNAP}/tunnels"/* "$TUNNELS_DIR/" 2>/dev/null || true
-                fi
-                echo "  Config restored."
-                ;;
-        esac
-    fi
-    [ -f "${SNAP}/spoof-tunnel.service" ] && \
-        cp -f "${SNAP}/spoof-tunnel.service" "$LEGACY_UNIT_FILE"
-    [ -f "${SNAP}/spoof-tunnel@.service" ] && \
-        cp -f "${SNAP}/spoof-tunnel@.service" "$TEMPLATE_UNIT_FILE"
-    systemctl daemon-reload
-
-    echo "  Starting services..."
-    local bad=""
-    if [ "$(host_mode)" = "legacy" ]; then
-        systemctl start spoof-tunnel 2>/dev/null || true
-        sleep 2
-        systemctl is-active spoof-tunnel >/dev/null 2>&1 || bad="spoof-tunnel"
-    else
-        local m
-        while IFS= read -r m; do
-            [ -z "$m" ] && continue
-            systemctl start "spoof-tunnel@${m}" 2>/dev/null || true
-            sleep 2
-            systemctl is-active "spoof-tunnel@${m}" >/dev/null 2>&1 || \
-                bad="${bad:+$bad }spoof-tunnel@${m}"
-        done < <(tunnel_names)
-    fi
-
-    if [ -z "$bad" ]; then
-        echo "  $(color_ok "Rollback complete. Services are running.")"
-    else
-        echo "  $(color_err "Failed to start after rollback: ${bad}")"
-        exit 1
-    fi
 }
 
 # ── uninstall ────────────────────────────────────────────────────────────────
@@ -1709,9 +1576,8 @@ show_menu() {
     echo " 11) Delete Tunnel"
     echo " 12) Migrate to multi-tunnel layout"
     echo " 13) Update"
-    echo " 14) Rollback"
-    echo " 15) Uninstall"
-    echo " 16) Exit"
+    echo " 14) Uninstall"
+    echo " 15) Exit"
     hr
     echo ""
 }
@@ -1720,7 +1586,7 @@ interactive_menu() {
     local CHOICE
     while true; do
         show_menu
-        read -rp "  Choice [1-16]: " CHOICE || true
+        read -rp "  Choice [1-15]: " CHOICE || true
         echo ""
         # A refusal or a validation failure must not kill the menu.
         case "$CHOICE" in
@@ -1741,9 +1607,8 @@ interactive_menu() {
                 ;;
             12) cmd_migrate "" || true ;;
             13) cmd_update || true ;;
-            14) cmd_rollback || true ;;
-            15) cmd_uninstall; break ;;
-            16|q|quit|exit) echo "  Bye."; break ;;
+            14) cmd_uninstall; break ;;
+            15|q|quit|exit) echo "  Bye."; break ;;
             *)  echo "  Invalid choice." ;;
         esac
         echo ""
@@ -1786,7 +1651,6 @@ case "$CMD" in
     delete)          cmd_delete      "$POS_TUNNEL" ;;
     migrate)         cmd_migrate     "${1:-}" ;;
     update)          cmd_update ;;
-    rollback)        cmd_rollback ;;
     uninstall)       cmd_uninstall ;;
     -h|--help|help)
         cat << 'HELPEOF'
@@ -1819,7 +1683,6 @@ Port forwarding (client nodes only; use -t NAME to pick the tunnel):
 
 Host:
   update                  Download and install the latest release
-  rollback                Restore a previous snapshot
   uninstall               Remove spoof-tunnel and every tunnel
 
 With no command, shows the interactive menu.

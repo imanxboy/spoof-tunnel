@@ -6,13 +6,17 @@
 #
 #   --tooling-only  Install the binary, hooks, scripts and the
 #                   spoof-tunnel@.service template, and nothing else. No
-#                   config.yaml is read and no service is touched. This is
-#                   what an upgrade runs on a host that already has its
-#                   tunnels under /etc/spoof-tunnel/tunnels/.
+#                   config.yaml is read and no service is touched.
 #
-# Without --tooling-only the script also installs a single tunnel from
-# ./config.yaml onto the plain spoof-tunnel.service unit — the original
-# layout, still used by hosts that have not run 'spoofctl migrate'.
+# Tooling-only is also what happens when there is no ./config.yaml, which is
+# the normal case: installing puts the tools on the host, and tunnels are
+# created afterwards with `spoofctl create`. Nothing here invents an address
+# or starts a tunnel on its own.
+#
+# With a ./config.yaml present the script additionally installs that single
+# tunnel onto the plain spoof-tunnel.service unit. That is the original
+# layout, kept so hosts which have not run `spoofctl migrate` can still be
+# upgraded in place.
 set -euo pipefail
 
 PACKAGE_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -70,13 +74,13 @@ if [ ! -e /dev/net/tun ]; then
     fi
 fi
 
-if [ "${TOOLING_ONLY}" = "0" ]; then
-    if [ ! -f "${CONFIG_YAML}" ]; then
-        echo "ERROR: config.yaml not found at ${CONFIG_YAML}" >&2
-        echo "       Copy config.yaml.example to config.yaml and edit it." >&2
-        exit 1
-    fi
+# No config.yaml means "just install the tools" — the operator creates
+# tunnels afterwards with `spoofctl create`, entering their own addresses.
+if [ "${TOOLING_ONLY}" = "0" ] && [ ! -f "${CONFIG_YAML}" ]; then
+    TOOLING_ONLY=1
+fi
 
+if [ "${TOOLING_ONLY}" = "0" ]; then
     # Validate config before doing anything
     python3 "${PACKAGE_DIR}/scripts/config-parse.py" --validate "${CONFIG_YAML}" 2>&1 \
         || { echo "ERROR: config.yaml validation failed" >&2; exit 1; }
@@ -112,7 +116,12 @@ if [ "${TOOLING_ONLY}" = "0" ]; then
         exit 0
     fi
 else
-    log "Tooling-only mode: not touching any tunnel config."
+    log "Installing tools only — no tunnel is created or started."
+    # Switch the host to the named-instance layout, unless it is still on the
+    # original single-tunnel one, which `spoofctl migrate` converts on request.
+    if [ ! -f /etc/spoof-tunnel/config.yaml ]; then
+        mkdir -p "${TUNNELS_DIR}"
+    fi
 fi
 
 # ── verify full-install prerequisites ────────────────────────────────────────
@@ -426,11 +435,13 @@ log "Reloading systemd..."
 systemctl daemon-reload
 
 if [ "${TOOLING_ONLY}" = "1" ]; then
-    log "Tooling installed. Existing tunnels are untouched."
+    log "Tooling installed. No tunnel was created."
     echo ""
     echo "  Binary:   ${BIN_DST}"
     echo "  Template: ${TEMPLATE_UNIT_FILE}"
-    echo "  Manage:   spoofctl"
+    echo ""
+    echo "  Create a tunnel:  spoofctl create <name>"
+    echo "  List tunnels:     spoofctl list"
     exit 0
 fi
 
