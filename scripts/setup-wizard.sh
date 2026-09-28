@@ -96,9 +96,13 @@ TAKEN_TUNS=""
 TAKEN_PORTS=""
 TAKEN_TUN_IPS=""
 
+# Values may be quoted (EXTRA_ARGS always is), so strip a surrounding pair.
 env_get() {
+    local v
     [ -f "$1" ] || return 0
-    sed -n "s/^${2}=//p" "$1" | tail -1
+    v="$(sed -n "s/^${2}=//p" "$1" | tail -1)"
+    v="${v%\"}"; v="${v#\"}"
+    printf '%s' "$v"
 }
 
 scan_siblings() {

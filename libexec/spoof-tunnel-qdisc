@@ -44,10 +44,14 @@ LIMIT=50000
 # ── resolve flow_limit across every tunnel on this interface ────────────────
 
 # Read one variable out of an env file without polluting our own environment.
+# Values may be quoted (EXTRA_ARGS always is, because it contains spaces), so
+# strip a surrounding pair before returning.
 env_get() {
-    local file="$1" key="$2"
+    local file="$1" key="$2" v
     [ -f "$file" ] || return 0
-    sed -n "s/^${key}=//p" "$file" | tail -1
+    v="$(sed -n "s/^${key}=//p" "$file" | tail -1)"
+    v="${v%\"}"; v="${v#\"}"
+    printf '%s' "$v"
 }
 
 FL="${FLOW_LIMIT:-1000}"

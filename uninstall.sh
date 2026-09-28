@@ -13,9 +13,13 @@ LEGACY_ENV="/etc/spoof-tunnel/tunnel.env"
 LIBEXEC_DIR="/usr/local/libexec"
 FORWARD_HOOK="${LIBEXEC_DIR}/spoof-tunnel-forward"
 
+# Values may be quoted (EXTRA_ARGS always is), so strip a surrounding pair.
 env_get() {
+    local v
     [ -f "$1" ] || return 0
-    sed -n "s/^${2}=//p" "$1" | tail -1
+    v="$(sed -n "s/^${2}=//p" "$1" | tail -1)"
+    v="${v%\"}"; v="${v#\"}"
+    printf '%s' "$v"
 }
 
 # Tear one tunnel down completely: stop it, then remove every rule and device

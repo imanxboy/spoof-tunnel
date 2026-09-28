@@ -49,7 +49,7 @@
 
 /* ── constants ─────────────────────────────────────────────────────────── */
 
-#define VERSION          "6.2.0"
+#define VERSION          "6.2.1"
 #define MAX_SPOOF        16
 #define OUTER_HDR        58   /* 14 eth + 20 ip + 8 udp + 16 tun_hdr */
 #define TUN_HDR_OFF      42   /* offset of tun_hdr within OUTER_HDR */

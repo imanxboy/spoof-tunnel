@@ -111,11 +111,15 @@ has_tunnel() {
     esac
 }
 
-# Read one variable from an env file without sourcing it.
+# Read one variable from an env file without sourcing it. Values may be
+# quoted (EXTRA_ARGS always is, because it contains spaces), so strip a
+# surrounding pair before returning.
 env_get() {
-    local file="$1" key="$2"
+    local file="$1" key="$2" v
     [ -f "$file" ] || return 0
-    sed -n "s/^${key}=//p" "$file" | tail -1
+    v="$(sed -n "s/^${key}=//p" "$file" | tail -1)"
+    v="${v%\"}"; v="${v#\"}"
+    printf '%s' "$v"
 }
 
 svc_state() {
@@ -1379,6 +1383,23 @@ cmd_update() {
         # Nothing host-wide depends on a single config here, so only the
         # tooling and the template unit are (re)installed.
         bash "${PKG_DIR}/install.sh" --tooling-only
+
+        # --tooling-only reads no config, so regenerate each instance's env
+        # from its YAML here. config.yaml is the source of truth, and this is
+        # what a legacy host gets for free from install.sh. It also repairs an
+        # env written by an older parser.
+        local n
+        while IFS= read -r n; do
+            [ -z "$n" ] && continue
+            TUNNEL="$n"
+            TCONF="${TUNNELS_DIR}/${n}.yaml"
+            TENV="${TUNNELS_DIR}/${n}.env"
+            if regen_env; then
+                echo "  Regenerated ${TENV}"
+            else
+                echo "  $(color_warn "Could not regenerate ${TENV} — keeping the existing one.")"
+            fi
+        done < <(tunnel_names)
     fi
 
     # Self-update spoofctl — install.sh does not install it.

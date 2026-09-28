@@ -429,7 +429,7 @@ def main():
         f'WATCHDOG_SEC={watchdog_sec}',
         f'SYSCTL_TUNE={"true" if sysctl_tune else "false"}',
         f'PROM_ENABLED={"true" if prom_enabled else "false"}',
-        f'PROM_DIR={prom_dir}',
+        f'PROM_DIR="{prom_dir}"',
         f'QDISC_MON_INTERVAL={qdisc_mon_int}',
         f'LOG_RETENTION_DAYS={log_retention}',
     ]
@@ -442,12 +442,20 @@ def main():
     # instance, so it cannot decide per-tunnel whether to pass --spoof-ips or
     # --json-metrics; it expands $EXTRA_ARGS instead (unbraced, so systemd
     # splits it into words). Empty expands to no arguments at all.
+    #
+    # The value MUST be quoted. It is the only emitted value containing
+    # spaces, and this file is read two ways: systemd's EnvironmentFile
+    # parser, which would take the rest of the line either way, and bash
+    # `source`, used by every hook and script, which would otherwise read
+    # `EXTRA_ARGS=--spoof-ips 1.2.3.4 --json-metrics` as an assignment
+    # followed by a command named `1.2.3.4`, exit 127, and abort the caller
+    # under `set -e`. Both parsers strip the quotes.
     extra = []
     if spoof_str:
         extra += ['--spoof-ips', spoof_str]
     if json_metrics:
         extra.append('--json-metrics')
-    lines.append(f'EXTRA_ARGS={" ".join(extra)}')
+    lines.append(f'EXTRA_ARGS="{" ".join(extra)}"')
 
     output = '\n'.join(lines) + '\n'
 

@@ -18,9 +18,13 @@ LOG_DIR="/var/log/spoof-tunnel"
 
 VERSION_LABEL=$(cat /etc/spoof-tunnel/VERSION 2>/dev/null || echo "unknown")
 
+# Values may be quoted (EXTRA_ARGS always is), so strip a surrounding pair.
 env_get() {
+    local v
     [ -f "$1" ] || return 0
-    sed -n "s/^${2}=//p" "$1" | tail -1
+    v="$(sed -n "s/^${2}=//p" "$1" | tail -1)"
+    v="${v%\"}"; v="${v#\"}"
+    printf '%s' "$v"
 }
 
 # ── metric help/type headers, emitted once ──────────────────────────────────

@@ -12,9 +12,13 @@ TUNNELS_DIR="/etc/spoof-tunnel/tunnels"
 LEGACY_ENV="/etc/spoof-tunnel/tunnel.env"
 LOG_DIR="/var/log/spoof-tunnel"
 
+# Values may be quoted (EXTRA_ARGS always is), so strip a surrounding pair.
 env_get() {
+    local v
     [ -f "$1" ] || return 0
-    sed -n "s/^${2}=//p" "$1" | tail -1
+    v="$(sed -n "s/^${2}=//p" "$1" | tail -1)"
+    v="${v%\"}"; v="${v#\"}"
+    printf '%s' "$v"
 }
 
 scrape() {
