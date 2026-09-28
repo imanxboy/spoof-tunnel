@@ -49,7 +49,7 @@
 
 /* ── constants ─────────────────────────────────────────────────────────── */
 
-#define VERSION          "6.1.0"
+#define VERSION          "6.2.0"
 #define MAX_SPOOF        16
 #define OUTER_HDR        58   /* 14 eth + 20 ip + 8 udp + 16 tun_hdr */
 #define TUN_HDR_OFF      42   /* offset of tun_hdr within OUTER_HDR */
@@ -66,8 +66,18 @@
 #define TCP_RECONNECT_MS 2000
 #define METRIC_INTERVAL  5          /* seconds */
 #define WATCHDOG_DIVISOR 3          /* send watchdog every interval/3 */
-#define HEALTH_JSON      "/run/spoof-tunnel/health.json"
-#define METRICS_JSONL    "/var/log/spoof-tunnel/metrics.jsonl"
+#define RUN_DIR          "/run/spoof-tunnel"
+#define LOG_DIR          "/var/log/spoof-tunnel"
+#define HEALTH_JSON      RUN_DIR "/health.json"
+#define METRICS_JSONL    LOG_DIR "/metrics.jsonl"
+#define MAX_NAME         16
+
+/* Runtime paths. Without --name these hold the two defines above, which is
+ * what keeps a pre-multi-tunnel install working unchanged. With --name <n>
+ * they become <dir>/<n>/... so several instances can run side by side. */
+static char health_path[256]  = HEALTH_JSON;
+static char metrics_path[256] = METRICS_JSONL;
+static char health_tmp[256]   = HEALTH_JSON ".tmp";
 
 #define MODE_CLIENT  0
 #define MODE_SERVER  1
@@ -89,6 +99,7 @@ struct __attribute__((packed)) tun_hdr {
 struct config {
     int      mode;
     int      outer;
+    char     name[MAX_NAME];        /* instance name; empty = legacy paths */
     char     iface[IFNAMSIZ];
     char     tun_name[IFNAMSIZ];
     uint32_t spoof_ips[MAX_SPOOF];  /* network byte order */
@@ -1023,7 +1034,7 @@ static void *rx_thread_tcp(void *arg)
 static void write_health_json(uint64_t tx_pps, uint64_t rx_pps,
                                float loss_pct, bool qdisc_ok)
 {
-    FILE *f = fopen(HEALTH_JSON ".tmp", "we");
+    FILE *f = fopen(health_tmp, "we");
     if (!f) return;
     fprintf(f, "{"
             "\"ts\":%llu,"
@@ -1041,7 +1052,7 @@ static void write_health_json(uint64_t tx_pps, uint64_t rx_pps,
             qdisc_ok ? "true" : "false",
             VERSION);
     fclose(f);
-    rename(HEALTH_JSON ".tmp", HEALTH_JSON);
+    rename(health_tmp, health_path);
 }
 
 static void append_metrics_jsonl(uint64_t d_tx, uint64_t d_rx,
@@ -1049,7 +1060,7 @@ static void append_metrics_jsonl(uint64_t d_tx, uint64_t d_rx,
                                   uint64_t d_loss, uint64_t d_reorder,
                                   uint64_t d_retry, int interval_s)
 {
-    FILE *f = fopen(METRICS_JSONL, "ae");
+    FILE *f = fopen(metrics_path, "ae");
     if (!f) return;
     fprintf(f, "{"
             "\"ts\":%llu,"
@@ -1173,6 +1184,8 @@ static void usage(const char *name)
     fprintf(stderr,
         "usage: %s [options]\n"
         "  --mode client|server\n"
+        "  --name NAME          instance name; puts health.json and\n"
+        "                       metrics.jsonl under a per-instance dir\n"
         "  --outer udp|tcp\n"
         "  --iface NAME         physical interface (UDP mode)\n"
         "  --tun NAME           TUN device name (default: tun0)\n"
@@ -1228,6 +1241,7 @@ static void parse_args(int argc, char **argv)
     c->json_metrics       = false;
     c->watchdog_sec       = 0;
     snprintf(c->tun_name, IFNAMSIZ, "%s", "tun0");
+    c->name[0] = 0;
 
     for (int i = 1; i < argc; i++) {
 #define NEED_ARG() if (i+1 >= argc) { fprintf(stderr, "%s requires arg\n", argv[i]); exit(1); }
@@ -1243,6 +1257,9 @@ static void parse_args(int argc, char **argv)
         } else if (!strcmp(argv[i], "--tun")) {
             NEED_ARG(); i++;
             snprintf(c->tun_name, IFNAMSIZ, "%s", argv[i]);
+        } else if (!strcmp(argv[i], "--name")) {
+            NEED_ARG(); i++;
+            snprintf(c->name, MAX_NAME, "%s", argv[i]);
         } else if (!strcmp(argv[i], "--spoof-ips")) {
             NEED_ARG(); i++;
             char *tok = strtok(argv[i], ",");
@@ -1334,8 +1351,23 @@ int main(int argc, char **argv)
 {
     parse_args(argc, argv);
 
-    /* ensure /run/spoof-tunnel/ exists */
-    mkdir("/run/spoof-tunnel", 0755);
+    /* Runtime paths. An instance name gives each tunnel its own directory;
+     * without one the flat legacy paths are kept. */
+    mkdir(RUN_DIR, 0755);
+    mkdir(LOG_DIR, 0755);
+    if (st.cfg.name[0]) {
+        snprintf(health_path,  sizeof health_path,
+                 RUN_DIR "/%s/health.json", st.cfg.name);
+        snprintf(health_tmp,   sizeof health_tmp,
+                 RUN_DIR "/%s/health.json.tmp", st.cfg.name);
+        snprintf(metrics_path, sizeof metrics_path,
+                 LOG_DIR "/%s/metrics.jsonl", st.cfg.name);
+        char dir[256];
+        snprintf(dir, sizeof dir, RUN_DIR "/%s", st.cfg.name);
+        mkdir(dir, 0755);
+        snprintf(dir, sizeof dir, LOG_DIR "/%s", st.cfg.name);
+        mkdir(dir, 0755);
+    }
 
     /* signals */
     st.running = 1;
@@ -1391,7 +1423,7 @@ int main(int argc, char **argv)
     pthread_join(met_tid, NULL);
 
     /* update health.json to reflect clean shutdown */
-    FILE *f = fopen(HEALTH_JSON, "we");
+    FILE *f = fopen(health_path, "we");
     if (f) { fprintf(f, "{\"up\":0,\"ts\":%llu}\n",
                      (unsigned long long)now_ms()); fclose(f); }
 

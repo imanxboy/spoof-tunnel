@@ -199,20 +199,68 @@ spoofctl rollback
 This shows available snapshots (taken before each update) and restores
 the selected one.
 
-### How do I delete the tunnel but keep the tooling?
+### Can one host run more than one tunnel?
+
+Yes. Each tunnel is a named instance with its own config
+(`/etc/spoof-tunnel/tunnels/<name>.yaml`), its own `spoof-tunnel@<name>` unit,
+its own TUN device and its own forwarding rules.
 
 ```bash
-spoofctl delete
+spoofctl create de1     # add one
+spoofctl list           # numbered table of all of them
+spoofctl status de1     # or -t de1 on any command
+spoofctl delete de1     # removes only de1
 ```
 
-This stops and disables the service, removes every iptables rule the tunnel
-owns (forwarding DNAT/FORWARD/MASQUERADE plus the `INPUT ... -j DROP` rule on
-the outer UDP port), deletes the TUN device, and removes `config.yaml` and
-`tunnel.env` after backing them up to
-`/var/backups/spoof-tunnel/deleted-<timestamp>/`.
+Commands that act on a single tunnel take its name positionally or as
+`-t NAME`. With one tunnel the name is optional; with several, omitting it
+opens a numbered picker.
 
-The binary, `spoofctl` and the hooks stay installed, so you can set up a
-different tunnel right away:
+A new tunnel may not reuse another's `tun_name`, `listen_port`, TUN IP pair or
+forwarded ports — the installer rejects that, which is what keeps the tunnels
+from interfering. The wizard defaults to free values, so accepting every
+default produces a working config.
+
+### My host was installed before multi-tunnel support. What happens?
+
+Nothing, until you ask. `spoofctl update` leaves it on the original
+`spoof-tunnel.service` and the tunnel keeps running. When you want to add a
+second tunnel:
+
+```bash
+spoofctl migrate
+```
+
+That names the existing tunnel (`main` by default) and moves it onto
+`spoof-tunnel@main.service`, restarting it once. If it does not come back up,
+the config, env and unit are restored from a snapshot and the original service
+is started again. `spoofctl create` refuses to run until you have migrated, so
+the two layouts never coexist.
+
+### Several tunnels share one NIC — do they fight over the qdisc?
+
+No, but only because it is handled explicitly. `fq` belongs to the physical
+interface, so the qdisc hook applies the highest `flow_limit` among all the
+tunnels on that interface rather than whichever started last. The qdisc log is
+per interface (`/var/log/spoof-tunnel/qdisc-<iface>.log`), and tunnels sharing
+a NIC therefore report the same queue figures.
+
+### How do I delete one tunnel but keep the tooling?
+
+```bash
+spoofctl delete [NAME]
+```
+
+This stops and disables that tunnel's service, removes every iptables rule it
+owns (its forwarding DNAT/FORWARD/MASQUERADE plus the `INPUT ... -j DROP` rule
+on its outer UDP port), deletes its TUN device, and removes its config and env
+after backing them up to
+`/var/backups/spoof-tunnel/deleted-<name>-<timestamp>/`.
+
+Every other tunnel on the host is left running.
+
+The binary, `spoofctl` and the hooks stay installed, so you can set up
+another tunnel right away:
 
 ```bash
 spoofctl create
@@ -227,8 +275,9 @@ systemd unit from the new config, and starts the service.
 spoofctl uninstall
 ```
 
-This stops and disables the service, removes every iptables rule and the TUN
-device, removes all installed files, and optionally removes config and logs.
+This stops and disables every tunnel on the host, removes each one's iptables
+rules and TUN device, removes all installed files, and optionally removes
+config and logs.
 
 ---
 

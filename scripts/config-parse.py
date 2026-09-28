@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-config-parse.py — translate config.yaml into /etc/spoof-tunnel/tunnel.env
-and auto-detect hardware parameters.
+config-parse.py — translate a tunnel's config.yaml into its env file and
+auto-detect hardware parameters.
 
 Usage:
-  config-parse.py [--validate] [--output PATH] config.yaml
+  config-parse.py [--validate] [--output PATH]
+                  [--instance NAME] [--tunnels-dir DIR] config.yaml
+
+With --instance, the config is also checked against every other tunnel
+configured on the host (the sibling *.env files in --tunnels-dir) and rejected
+if it would collide with one. That check is what lets several tunnels share a
+host safely: because tun_name, listen_port, the TUN IP pair and the forwarded
+ports are guaranteed unique, the iptables rules and network devices belonging
+to different tunnels never overlap.
 """
 import sys, os, subprocess, socket, struct, fcntl, json, re
 
@@ -145,19 +153,111 @@ def die(msg):
 
 # ── main ───────────────────────────────────────────────────────────────────
 
+VALID_NAME = re.compile(r'^[a-z0-9][a-z0-9_-]{0,15}$')
+
+
+def read_env(path):
+    """Parse a KEY=value env file into a dict. Returns {} if unreadable."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, _, v = line.partition('=')
+                out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def sibling_envs(tunnels_dir, instance):
+    """Every other instance's env, as {name: {KEY: value}}."""
+    out = {}
+    try:
+        names = sorted(os.listdir(tunnels_dir))
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith('.env'):
+            continue
+        name = fn[:-4]
+        if name == instance:
+            continue
+        out[name] = read_env(os.path.join(tunnels_dir, fn))
+    return out
+
+
+def check_collisions(siblings, tun_name, listen_port, local_tun, peer_tun,
+                     fwd_ports):
+    """Reject anything another tunnel on this host already owns."""
+    ports = set(int(p) for p in fwd_ports)
+    for name, env in siblings.items():
+        if env.get('TUN_NAME') == tun_name:
+            die(f"network.tun_name '{tun_name}' is already used by tunnel "
+                f"'{name}'. Pick a different TUN device name.")
+
+        other_listen = env.get('LISTEN_PORT', '')
+        if other_listen and int(other_listen) == listen_port:
+            die(f"tunnel.listen_port {listen_port} is already used by tunnel "
+                f"'{name}'. Each tunnel needs its own listen port.")
+
+        other_ips = {env.get('LOCAL_TUN', ''), env.get('PEER_TUN', '')}
+        clash = other_ips & {local_tun, peer_tun}
+        clash.discard('')
+        if clash:
+            die(f"TUN IP {sorted(clash)[0]} is already used by tunnel "
+                f"'{name}'. Set network.local_tun_ip / peer_tun_ip to an "
+                f"unused pair.")
+
+        other_fwd = set()
+        raw = env.get('FORWARD_PORTS', '')
+        if raw:
+            other_fwd = set(int(x) for x in raw.split(',') if x.strip())
+        overlap = ports & other_fwd
+        if overlap:
+            die(f"forwarding.ports {sorted(overlap)} already forwarded by "
+                f"tunnel '{name}'. A port can only be forwarded once.")
+
+        if other_listen and int(other_listen) in ports:
+            die(f"forwarding.ports {other_listen} is the listen port of "
+                f"tunnel '{name}'. Forwarding it would hijack that tunnel.")
+
+
 def main():
     validate_only = '--validate' in sys.argv
-    output_path = None
-    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    output_path  = None
+    instance     = None
+    tunnels_dir  = '/etc/spoof-tunnel/tunnels'
 
-    for i, a in enumerate(sys.argv[1:]):
-        if a == '--output' and i+2 < len(sys.argv):
-            output_path = sys.argv[i+2]
+    # Positional args are everything that is neither a flag nor a flag's value.
+    argv = sys.argv[1:]
+    args = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--output':
+            output_path = argv[i+1] if i+1 < len(argv) else None; i += 2
+        elif a == '--instance':
+            instance = argv[i+1] if i+1 < len(argv) else None; i += 2
+        elif a == '--tunnels-dir':
+            tunnels_dir = argv[i+1] if i+1 < len(argv) else tunnels_dir; i += 2
+        elif a.startswith('--'):
+            i += 1
+        else:
+            args.append(a); i += 1
 
     if not args:
-        print(f"usage: {sys.argv[0]} [--validate] [--output PATH] config.yaml",
+        print(f"usage: {sys.argv[0]} [--validate] [--output PATH] "
+              f"[--instance NAME] [--tunnels-dir DIR] config.yaml",
               file=sys.stderr)
         sys.exit(1)
+
+    if instance is not None and not VALID_NAME.match(instance):
+        die(f"invalid instance name '{instance}': use 1-16 characters, "
+            f"lowercase letters, digits, '-' or '_', starting with a letter "
+            f"or digit")
 
     cfg_path = args[-1]
     try:
@@ -293,6 +393,13 @@ def main():
         fwd_ports.append(str(port))
     fwd_str = ','.join(fwd_ports)
 
+    # ── cross-instance collisions ───────────────────────────────────────────
+    # Runs for both --validate and a real write, so a bad config is rejected
+    # before it can overwrite a good env file.
+    if instance is not None:
+        check_collisions(sibling_envs(tunnels_dir, instance),
+                         tun_name, listen_port, local_tun, peer_tun, fwd_ports)
+
     if validate_only:
         print("config OK")
         return
@@ -329,6 +436,18 @@ def main():
     if spoof_str:
         lines.append(f'SPOOF_IPS={spoof_str}')
     lines.append(f'FORWARD_PORTS={fwd_str}')
+
+    # Optional ExecStart flags, pre-assembled here rather than baked into the
+    # unit file. spoof-tunnel@.service is a single template shared by every
+    # instance, so it cannot decide per-tunnel whether to pass --spoof-ips or
+    # --json-metrics; it expands $EXTRA_ARGS instead (unbraced, so systemd
+    # splits it into words). Empty expands to no arguments at all.
+    extra = []
+    if spoof_str:
+        extra += ['--spoof-ips', spoof_str]
+    if json_metrics:
+        extra.append('--json-metrics')
+    lines.append(f'EXTRA_ARGS={" ".join(extra)}')
 
     output = '\n'.join(lines) + '\n'
 

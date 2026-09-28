@@ -82,6 +82,87 @@ sys.exit(1)
 
 hr() { echo "  ────────────────────────────────────────────────────"; }
 
+# ── sibling tunnels ──────────────────────────────────────────────────────────
+#
+# spoofctl exports ST_TUNNELS_DIR and ST_INSTANCE when it runs the wizard to
+# add a tunnel to a host that already has some. Reading what those tunnels
+# already own lets every default we offer be free, so the operator can hold
+# Enter through the wizard and still get a config that installs.
+
+TUNNELS_DIR="${ST_TUNNELS_DIR:-/etc/spoof-tunnel/tunnels}"
+INSTANCE="${ST_INSTANCE:-}"
+
+TAKEN_TUNS=""
+TAKEN_PORTS=""
+TAKEN_TUN_IPS=""
+
+env_get() {
+    [ -f "$1" ] || return 0
+    sed -n "s/^${2}=//p" "$1" | tail -1
+}
+
+scan_siblings() {
+    local f n
+    [ -d "$TUNNELS_DIR" ] || return 0
+    for f in "${TUNNELS_DIR}"/*.env; do
+        [ -f "$f" ] || continue
+        n="$(basename "$f")"; n="${n%.env}"
+        [ "$n" = "$INSTANCE" ] && continue
+        TAKEN_TUNS="${TAKEN_TUNS} $(env_get "$f" TUN_NAME)"
+        TAKEN_PORTS="${TAKEN_PORTS} $(env_get "$f" LISTEN_PORT)"
+        TAKEN_PORTS="${TAKEN_PORTS} $(env_get "$f" FORWARD_PORTS | tr ',' ' ')"
+        TAKEN_TUN_IPS="${TAKEN_TUN_IPS} $(env_get "$f" LOCAL_TUN) $(env_get "$f" PEER_TUN)"
+    done
+}
+scan_siblings
+
+is_taken() {  # is_taken <value> <list>
+    case " ${2} " in *" ${1} "*) return 0 ;; esac
+    return 1
+}
+
+sibling_count() {
+    local c=0 f
+    [ -d "$TUNNELS_DIR" ] || { echo 0; return; }
+    for f in "${TUNNELS_DIR}"/*.env; do [ -f "$f" ] && c=$(( c + 1 )); done
+    echo "$c"
+}
+
+# First tunN not already used by another tunnel, and not already a live device.
+free_tun_name() {
+    local i=0
+    while [ "$i" -lt 64 ]; do
+        if ! is_taken "tun${i}" "$TAKEN_TUNS" && \
+           ! ip link show "tun${i}" >/dev/null 2>&1; then
+            echo "tun${i}"; return
+        fi
+        i=$(( i + 1 ))
+    done
+    echo "tun0"
+}
+
+# First 10.100.N.0/30 pair whose addresses nobody else holds.
+free_tun_subnet() {
+    local n=100
+    while [ "$n" -lt 250 ]; do
+        if ! is_taken "10.100.${n}.1" "$TAKEN_TUN_IPS" && \
+           ! is_taken "10.100.${n}.2" "$TAKEN_TUN_IPS"; then
+            echo "$n"; return
+        fi
+        n=$(( n + 1 ))
+    done
+    echo 100
+}
+
+free_listen_port() {
+    local p=2080
+    while [ "$p" -lt 2200 ]; do
+        is_taken "$p" "$TAKEN_PORTS" || { echo "$p"; return; }
+        p=$(( p + 1 ))
+    done
+    echo 2080
+}
+
 # ── check existing config ────────────────────────────────────────────────────
 
 if [ -f "$OUTPUT" ]; then
@@ -102,7 +183,17 @@ echo "  ┌───────────────────────
 echo "  │         spoof-tunnel v6 — Setup Wizard           │"
 echo "  └──────────────────────────────────────────────────┘"
 echo ""
-echo "  This wizard creates config.yaml for your tunnel node."
+if [ -n "${INSTANCE}" ]; then
+    echo "  This wizard creates the config for tunnel '${INSTANCE}'."
+    _SIBS="$(sibling_count)"
+    if [ "${_SIBS}" -gt 0 ]; then
+        echo ""
+        echo "  This host already runs ${_SIBS} other tunnel(s). The defaults"
+        echo "  below skip every TUN device, port and TUN IP they already use."
+    fi
+else
+    echo "  This wizard creates config.yaml for your tunnel node."
+fi
 echo "  Press Enter to accept the default shown in [brackets]."
 echo ""
 
@@ -256,14 +347,20 @@ echo "  UDP port for the outer tunnel. Must be open between both machines."
 echo "  Avoid 443/80 (those are for the overlay service, e.g. Xray)."
 echo ""
 
+DEFAULT_PORT="$(free_listen_port)"
 PORT=""
 while true; do
-    read -rp "  Port [2080]: " PORT || true
-    PORT="${PORT:-2080}"
-    if [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; then
-        break
+    read -rp "  Port [${DEFAULT_PORT}]: " PORT || true
+    PORT="${PORT:-$DEFAULT_PORT}"
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+        echo "  Invalid port. Must be 1–65535."
+        continue
     fi
-    echo "  Invalid port. Must be 1–65535."
+    if is_taken "$PORT" "$TAKEN_PORTS"; then
+        echo "  Port ${PORT} is already used by another tunnel on this host."
+        continue
+    fi
+    break
 done
 
 # ── step 6: rate limit ───────────────────────────────────────────────────────
@@ -302,25 +399,36 @@ echo "  Each end of the tunnel gets a private IP on the TUN interface."
 echo "  Use any RFC 1918 /30 pair that doesn't conflict with your routing."
 echo ""
 
+SUBNET="$(free_tun_subnet)"
 if [ "$ROLE" = "server" ]; then
-    DEFAULT_LOCAL_TUN="10.100.100.1"
-    DEFAULT_PEER_TUN="10.100.100.2"
+    DEFAULT_LOCAL_TUN="10.100.${SUBNET}.1"
+    DEFAULT_PEER_TUN="10.100.${SUBNET}.2"
 else
-    DEFAULT_LOCAL_TUN="10.100.100.2"
-    DEFAULT_PEER_TUN="10.100.100.1"
+    DEFAULT_LOCAL_TUN="10.100.${SUBNET}.2"
+    DEFAULT_PEER_TUN="10.100.${SUBNET}.1"
 fi
+echo "  NOTE: both ends of THIS tunnel must use the same pair, mirrored."
+echo ""
 
 LOCAL_TUN=""
 PEER_TUN=""
-while ! valid_ip "${LOCAL_TUN:-}"; do
+while [ -z "${LOCAL_TUN}" ]; do
     read -rp "  Local TUN IP [${DEFAULT_LOCAL_TUN}]: " LOCAL_TUN || true
     LOCAL_TUN="${LOCAL_TUN:-$DEFAULT_LOCAL_TUN}"
-    if ! valid_ip "$LOCAL_TUN"; then echo "  Invalid IP."; LOCAL_TUN=""; fi
+    if ! valid_ip "$LOCAL_TUN"; then echo "  Invalid IP."; LOCAL_TUN=""; continue; fi
+    if is_taken "$LOCAL_TUN" "$TAKEN_TUN_IPS"; then
+        echo "  ${LOCAL_TUN} is already used by another tunnel on this host."
+        LOCAL_TUN=""
+    fi
 done
-while ! valid_ip "${PEER_TUN:-}"; do
+while [ -z "${PEER_TUN}" ]; do
     read -rp "  Peer  TUN IP [${DEFAULT_PEER_TUN}]: " PEER_TUN || true
     PEER_TUN="${PEER_TUN:-$DEFAULT_PEER_TUN}"
-    if ! valid_ip "$PEER_TUN"; then echo "  Invalid IP."; PEER_TUN=""; fi
+    if ! valid_ip "$PEER_TUN"; then echo "  Invalid IP."; PEER_TUN=""; continue; fi
+    if is_taken "$PEER_TUN" "$TAKEN_TUN_IPS"; then
+        echo "  ${PEER_TUN} is already used by another tunnel on this host."
+        PEER_TUN=""
+    fi
 done
 
 # ── step 8: TUN interface name ───────────────────────────────────────────────
@@ -330,9 +438,18 @@ hr
 echo ""
 echo "  Step 8 of 9 — TUN Interface Name"
 echo ""
-echo "  Name for the kernel TUN device. tun0 is fine unless already in use."
+echo "  Name for the kernel TUN device. Each tunnel needs its own."
 echo ""
-ask TUN_NAME "TUN name" "tun0"
+DEFAULT_TUN_NAME="$(free_tun_name)"
+TUN_NAME=""
+while [ -z "${TUN_NAME}" ]; do
+    read -rp "  TUN name [${DEFAULT_TUN_NAME}]: " TUN_NAME || true
+    TUN_NAME="${TUN_NAME:-$DEFAULT_TUN_NAME}"
+    if is_taken "$TUN_NAME" "$TAKEN_TUNS"; then
+        echo "  ${TUN_NAME} is already used by another tunnel on this host."
+        TUN_NAME=""
+    fi
+done
 
 # ── step 9: port forwarding (client only) ────────────────────────────────────
 

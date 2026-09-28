@@ -1,11 +1,27 @@
 #!/bin/bash
 # healthcheck.sh — Nagios-compatible exit codes.
 # 0=OK  1=WARNING  2=CRITICAL  3=UNKNOWN
-# Writes /run/spoof-tunnel/health.json summary.
+#
+# Usage: healthcheck.sh [instance]
+#
+# With an instance name it checks that tunnel's health.json and
+# spoof-tunnel@<name> unit; with none it checks the single-tunnel layout, so a
+# host that has not been migrated behaves exactly as before.
 set -euo pipefail
 
-HEALTH_JSON="/run/spoof-tunnel/health.json"
-QDISC_LOG="/var/log/spoof-tunnel/qdisc.log"
+INSTANCE="${1:-}"
+LOG_DIR="/var/log/spoof-tunnel"
+
+if [ -n "${INSTANCE}" ]; then
+    ENV_FILE="/etc/spoof-tunnel/tunnels/${INSTANCE}.env"
+    HEALTH_JSON="/run/spoof-tunnel/${INSTANCE}/health.json"
+    UNIT="spoof-tunnel@${INSTANCE}"
+else
+    ENV_FILE="/etc/spoof-tunnel/tunnel.env"
+    HEALTH_JSON="/run/spoof-tunnel/health.json"
+    UNIT="spoof-tunnel"
+fi
+
 WARN_LOSS=2.0
 CRIT_LOSS=5.0
 MAX_METRIC_AGE=15   # seconds
@@ -14,8 +30,8 @@ rc=0
 msg=""
 
 # 1. Service active?
-if ! systemctl is-active spoof-tunnel >/dev/null 2>&1; then
-    echo "CRITICAL: service=inactive"
+if ! systemctl is-active "${UNIT}" >/dev/null 2>&1; then
+    echo "CRITICAL: service=inactive (${UNIT})"
     exit 2
 fi
 
@@ -47,8 +63,11 @@ elif [ "${LOSS_INT}" -ge "${WARN_INT}" ]; then
     [ "${rc}" -lt 1 ] && rc=1
 fi
 
-# 4. qdisc drops (UDP mode)
-source /etc/spoof-tunnel/tunnel.env 2>/dev/null || true
+# 4. qdisc drops (UDP mode). The qdisc belongs to the physical interface, so
+#    its log is per interface rather than per tunnel.
+source "${ENV_FILE}" 2>/dev/null || true
+QDISC_LOG="${LOG_DIR}/qdisc-${IFACE:-unknown}.log"
+[ -f "${QDISC_LOG}" ] || QDISC_LOG="${LOG_DIR}/qdisc.log"
 if [ "${OUTER:-udp}" = "udp" ] && [ -f "${QDISC_LOG}" ]; then
     LAST=$(tail -1 "${QDISC_LOG}" 2>/dev/null || true)
     FP=$(echo "${LAST}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('flows_plimit',0))" 2>/dev/null || echo 0)

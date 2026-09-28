@@ -1,10 +1,26 @@
 #!/bin/bash
 # spoofctl — management CLI for spoof-tunnel v6
-# Usage: spoofctl [command]
-#   Commands: status start stop restart edit-config spoof-ips
+#
+# Usage: spoofctl [command] [tunnel] [-t tunnel]
+#   Commands: list status start stop restart edit-config spoof-ips
 #             forward list|add|del|replace|apply   (alias: forward-rules)
-#             create delete update rollback uninstall
+#             create delete migrate update rollback uninstall
 #   No command → interactive menu
+#
+# ── Host layouts ─────────────────────────────────────────────────────────────
+#
+# A host is in one of three states, and every command resolves against it:
+#
+#   multi   /etc/spoof-tunnel/tunnels/ exists. Any number of named tunnels,
+#           each with <name>.yaml, <name>.env and a spoof-tunnel@<name> unit.
+#   legacy  A pre-multi-tunnel install: a single /etc/spoof-tunnel/config.yaml
+#           on the plain spoof-tunnel.service unit. Fully supported, and
+#           'spoofctl migrate' converts it to the multi layout.
+#   empty   The tooling is installed but no tunnel is configured.
+#
+# Legacy hosts are never converted implicitly — 'update' leaves them running
+# exactly as they are. Only 'migrate' moves them, and it rolls back if the
+# migrated tunnel does not come up.
 set -euo pipefail
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -12,18 +28,28 @@ set -euo pipefail
 BIN="/usr/local/bin/spoof-tunnel"
 LIB_DIR="/usr/local/lib/spoof-tunnel"
 CONF_DIR="/etc/spoof-tunnel"
-CONF_YAML="${CONF_DIR}/config.yaml"
-ENV_FILE="${CONF_DIR}/tunnel.env"
-HEALTH_JSON="/run/spoof-tunnel/health.json"
+TUNNELS_DIR="${CONF_DIR}/tunnels"
+LEGACY_YAML="${CONF_DIR}/config.yaml"
+LEGACY_ENV="${CONF_DIR}/tunnel.env"
 BACKUP_DIR="/var/backups/spoof-tunnel"
-SERVICE="spoof-tunnel"
 UPDATE_CONF="${CONF_DIR}/update.conf"
 LIBEXEC_DIR="/usr/local/libexec"
 FORWARD_HOOK="${LIBEXEC_DIR}/spoof-tunnel-forward"
 PREPARE_HOOK="${LIBEXEC_DIR}/spoof-tunnel-prepare"
 QDISC_HOOK="${LIBEXEC_DIR}/spoof-tunnel-qdisc"
 WIZARD="${LIB_DIR}/setup-wizard.sh"
-SERVICE_FILE="/etc/systemd/system/${SERVICE}.service"
+SYSTEMD_DIR="/etc/systemd/system"
+LEGACY_UNIT_FILE="${SYSTEMD_DIR}/spoof-tunnel.service"
+TEMPLATE_UNIT_FILE="${SYSTEMD_DIR}/spoof-tunnel@.service"
+RUN_DIR="/run/spoof-tunnel"
+
+# Set by tun_resolve.
+TUNNEL=""      # instance name; empty on a legacy host
+TCONF=""       # this tunnel's config.yaml
+TENV=""        # this tunnel's env file
+TUNIT=""       # systemd unit name
+THEALTH=""     # this tunnel's health.json
+TLABEL=""      # what to print for this tunnel
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -36,60 +62,227 @@ color_ok()   { printf '\033[0;32m%s\033[0m' "$*"; }
 color_warn() { printf '\033[0;33m%s\033[0m' "$*"; }
 color_err()  { printf '\033[0;31m%s\033[0m' "$*"; }
 
-is_installed() {
-    [ -f "$BIN" ] && [ -f "$ENV_FILE" ]
+hr() {
+    echo "  ─────────────────────────────────────────────────────"
 }
 
 # The toolchain (binary, spoofctl, hooks) is present, regardless of whether a
-# tunnel is currently configured on top of it.
+# tunnel is configured on top of it.
 toolchain_present() {
     [ -f "$BIN" ]
 }
 
-# A tunnel has been created on this host: config.yaml and/or tunnel.env exist.
-has_tunnel() {
-    [ -f "$ENV_FILE" ] || [ -f "$CONF_YAML" ]
+valid_name() {
+    [[ "${1:-}" =~ ^[a-z0-9][a-z0-9_-]{0,15}$ ]]
 }
 
-# Remove the INPUT DROP rule that spoof-tunnel-prepare installs for the outer
-# UDP port. Nothing else removes it, so both 'delete' and 'uninstall' call this
-# — otherwise the port stays black-holed after the tunnel is gone.
-drop_input_rule() {
-    local port="${1:-${LISTEN_PORT:-}}"
-    [ -n "$port" ] || return 0
-    local n=0
-    while iptables -C INPUT -p udp --dport "$port" -j DROP 2>/dev/null; do
-        iptables -D INPUT -p udp --dport "$port" -j DROP
-        n=$(( n + 1 ))
-    done
-    [ "$n" -gt 0 ] && echo "  Removed INPUT DROP rule for udp/${port}."
-    return 0
-}
-
-# Tear down the TUN device. The tunnel process normally removes it on exit, but
-# a killed process (or a crash) leaves it behind and blocks a clean re-create.
-del_tun_device() {
-    local tun="${1:-${TUN_NAME:-tun0}}"
-    [ -n "$tun" ] || return 0
-    if ip link show "$tun" >/dev/null 2>&1; then
-        ip link set "$tun" down 2>/dev/null || true
-        ip link delete "$tun" 2>/dev/null || true
-        echo "  Removed TUN device: ${tun}"
+# multi | legacy | empty
+host_mode() {
+    if [ -d "$TUNNELS_DIR" ]; then
+        echo multi
+    elif [ -f "$LEGACY_YAML" ] || [ -f "$LEGACY_ENV" ]; then
+        echo legacy
+    else
+        echo empty
     fi
-    return 0
+}
+
+# Instance names, one per line, sorted. Empty on a legacy or empty host.
+tunnel_names() {
+    [ -d "$TUNNELS_DIR" ] || return 0
+    local f n
+    for f in "${TUNNELS_DIR}"/*.yaml; do
+        [ -f "$f" ] || continue
+        n="$(basename "$f")"
+        echo "${n%.yaml}"
+    done
+}
+
+tunnel_count() {
+    tunnel_names | grep -c . || true
+}
+
+# Any tunnel at all on this host?
+has_tunnel() {
+    case "$(host_mode)" in
+        legacy) return 0 ;;
+        multi)  [ "$(tunnel_count)" -gt 0 ] ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Read one variable from an env file without sourcing it.
+env_get() {
+    local file="$1" key="$2"
+    [ -f "$file" ] || return 0
+    sed -n "s/^${key}=//p" "$file" | tail -1
 }
 
 svc_state() {
-    systemctl is-active "${SERVICE}" 2>/dev/null || echo "inactive"
+    systemctl is-active "${1:-$TUNIT}" 2>/dev/null || echo "inactive"
 }
 
 load_env() {
-    [ -f "$ENV_FILE" ] || return 0
-    set -a; source "$ENV_FILE"; set +a
+    [ -n "$TENV" ] && [ -f "$TENV" ] || return 0
+    set -a; source "$TENV"; set +a
 }
 
-hr() {
-    echo "  ─────────────────────────────────────────────────────"
+# ── tunnel resolution ────────────────────────────────────────────────────────
+
+# Print a numbered table of the configured tunnels. Used by 'list' and by the
+# picker, so what you choose from looks the same as what 'list' shows.
+print_tunnel_table() {
+    local i=1 n role peer lport tun fwd state env
+    printf "   #  %-12s %-7s %-24s %-7s %-8s %s\n" \
+        "NAME" "ROLE" "PEER" "TUN" "SERVICE" "FORWARDED"
+    while IFS= read -r n; do
+        [ -z "$n" ] && continue
+        env="${TUNNELS_DIR}/${n}.env"
+        role="$(env_get "$env" MODE)"
+        peer="$(env_get "$env" PEER_IP):$(env_get "$env" PEER_PORT)"
+        tun="$(env_get "$env" TUN_NAME)"
+        fwd="$(env_get "$env" FORWARD_PORTS)"
+        state="$(svc_state "spoof-tunnel@${n}")"
+        printf -v state "%-8s" "$state"
+        if [[ "$state" == active* ]]; then
+            state="$(color_ok "$state")"
+        else
+            state="$(color_err "$state")"
+        fi
+        printf "  %2d  %-12s %-7s %-24s %-7s %s %s\n" \
+            "$i" "$n" "${role:-?}" "$peer" "${tun:-?}" "$state" "${fwd:-none}"
+        i=$(( i + 1 ))
+    done < <(tunnel_names)
+}
+
+# Ask which tunnel to act on. Echoes the chosen name on stdout; the menu goes
+# to stderr so the caller can capture the name cleanly.
+tun_pick() {
+    local -a names=()
+    local n idx
+    while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(tunnel_names)
+
+    [ "${#names[@]}" -eq 0 ] && die "No tunnels are configured on this host."
+    if [ "${#names[@]}" -eq 1 ]; then echo "${names[0]}"; return; fi
+
+    {
+        echo ""
+        hr
+        echo "  Which tunnel?"
+        hr
+        print_tunnel_table
+        hr
+        echo ""
+    } >&2
+
+    read -rp "  Choice [1-${#names[@]}]: " idx >&2 || true
+    [[ "$idx" =~ ^[0-9]+$ ]] || die "Invalid selection."
+    [ "$idx" -ge 1 ] && [ "$idx" -le "${#names[@]}" ] || die "Out of range."
+    echo "${names[$((idx-1))]}"
+}
+
+# tun_resolve [name] — pick the tunnel to act on and set TUNNEL/TCONF/TENV/
+# TUNIT/THEALTH/TLABEL. With no name: the only tunnel if there is one, else a
+# numbered picker when interactive, else an error naming the choices.
+tun_resolve() {
+    local want="${1:-}"
+
+    case "$(host_mode)" in
+        legacy)
+            if [ -n "$want" ]; then
+                die "This host still has the original single-tunnel layout, so
+       tunnels have no names yet. Convert it first with:  spoofctl migrate"
+            fi
+            TUNNEL=""
+            TCONF="$LEGACY_YAML"
+            TENV="$LEGACY_ENV"
+            TUNIT="spoof-tunnel"
+            THEALTH="${RUN_DIR}/health.json"
+            TLABEL="single tunnel (pre-migration)"
+            ;;
+
+        multi)
+            local count; count="$(tunnel_count)"
+            [ "$count" -gt 0 ] || \
+                die "No tunnels are configured on this host. Create one with: spoofctl create"
+
+            if [ -z "$want" ]; then
+                if [ "$count" -eq 1 ]; then
+                    want="$(tunnel_names | head -1)"
+                elif [ -t 0 ]; then
+                    want="$(tun_pick)"
+                else
+                    {
+                        echo "ERROR: this host has ${count} tunnels — name the one you mean."
+                        echo "       Available: $(tunnel_names | paste -sd' ' -)"
+                        echo "       e.g. spoofctl status <name>"
+                    } >&2
+                    exit 1
+                fi
+            fi
+
+            [ -f "${TUNNELS_DIR}/${want}.yaml" ] || \
+                die "No such tunnel: '${want}'. Available: $(tunnel_names | paste -sd' ' -)"
+
+            TUNNEL="$want"
+            TCONF="${TUNNELS_DIR}/${want}.yaml"
+            TENV="${TUNNELS_DIR}/${want}.env"
+            TUNIT="spoof-tunnel@${want}"
+            THEALTH="${RUN_DIR}/${want}/health.json"
+            TLABEL="$want"
+            ;;
+
+        empty)
+            die "No tunnel is configured on this host. Create one with: spoofctl create"
+            ;;
+    esac
+}
+
+# The instance argument the hooks take: the name, or nothing on a legacy host.
+hook_arg() { [ -n "$TUNNEL" ] && printf '%s' "$TUNNEL" || true; }
+
+# ── list ─────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    toolchain_present || die "spoof-tunnel is not installed."
+
+    case "$(host_mode)" in
+        legacy)
+            echo ""
+            hr
+            echo "  Tunnels"
+            hr
+            echo "  This host has the original single-tunnel layout, so there is"
+            echo "  exactly one tunnel and it has no name."
+            echo ""
+            printf "    role %s  peer %s:%s  tun %s  service %s\n" \
+                "$(env_get "$LEGACY_ENV" MODE)" \
+                "$(env_get "$LEGACY_ENV" PEER_IP)" \
+                "$(env_get "$LEGACY_ENV" PEER_PORT)" \
+                "$(env_get "$LEGACY_ENV" TUN_NAME)" \
+                "$(svc_state spoof-tunnel)"
+            echo ""
+            echo "  Run 'spoofctl migrate' to name it and allow more tunnels."
+            hr
+            ;;
+        multi)
+            local count; count="$(tunnel_count)"
+            echo ""
+            hr
+            printf "  Tunnels (%s)\n" "$count"
+            hr
+            if [ "$count" -eq 0 ]; then
+                echo "  None configured. Create one with: spoofctl create"
+            else
+                print_tunnel_table
+            fi
+            hr
+            ;;
+        empty)
+            echo "No tunnel is configured on this host."
+            echo "Create one with: spoofctl create"
+            ;;
+    esac
 }
 
 # ── status ───────────────────────────────────────────────────────────────────
@@ -99,31 +292,36 @@ cmd_status() {
         echo "spoof-tunnel is not installed."
         return
     fi
-    if ! is_installed; then
+    if ! has_tunnel; then
         echo "spoof-tunnel is installed, but no tunnel is configured."
         echo "Create one with: spoofctl create"
         return
     fi
+
+    tun_resolve "${1:-}"
+
     if [ -x "${LIB_DIR}/status.sh" ]; then
-        "${LIB_DIR}/status.sh"
+        "${LIB_DIR}/status.sh" "$(hook_arg)"
         return
     fi
+
     load_env
     hr
-    printf "  spoof-tunnel  [%s]\n" "${MODE:-unknown}"
+    printf "  spoof-tunnel  [%s]  %s\n" "${MODE:-unknown}" "$TLABEL"
     hr
-    STATE=$(svc_state)
-    if [ "$STATE" = "active" ]; then
-        printf "  Service: %s\n" "$(color_ok "$STATE")"
+    local state; state=$(svc_state)
+    if [ "$state" = "active" ]; then
+        printf "  Service: %s (%s)\n" "$(color_ok "$state")" "$TUNIT"
     else
-        printf "  Service: %s\n" "$(color_err "$STATE")"
+        printf "  Service: %s (%s)\n" "$(color_err "$state")" "$TUNIT"
     fi
     printf "  Peer: %s:%s\n" "${PEER_IP:-?}" "${PEER_PORT:-2080}"
-    if [ -f "$HEALTH_JSON" ]; then
-        TX=$(python3 -c "import json; d=json.load(open('$HEALTH_JSON')); print(d.get('tx_pps',0))" 2>/dev/null || echo 0)
-        RX=$(python3 -c "import json; d=json.load(open('$HEALTH_JSON')); print(d.get('rx_pps',0))" 2>/dev/null || echo 0)
-        LP=$(python3 -c "import json; d=json.load(open('$HEALTH_JSON')); print(d.get('loss_pct',0))" 2>/dev/null || echo 0)
-        printf "  TX: %s pps   RX: %s pps   Loss: %s%%\n" "$TX" "$RX" "$LP"
+    if [ -f "$THEALTH" ]; then
+        local tx rx lp
+        tx=$(python3 -c "import json;print(json.load(open('$THEALTH')).get('tx_pps',0))" 2>/dev/null || echo 0)
+        rx=$(python3 -c "import json;print(json.load(open('$THEALTH')).get('rx_pps',0))" 2>/dev/null || echo 0)
+        lp=$(python3 -c "import json;print(json.load(open('$THEALTH')).get('loss_pct',0))" 2>/dev/null || echo 0)
+        printf "  TX: %s pps   RX: %s pps   Loss: %s%%\n" "$tx" "$rx" "$lp"
     fi
     hr
 }
@@ -132,60 +330,73 @@ cmd_status() {
 
 cmd_start() {
     need_root
-    is_installed || die "spoof-tunnel is not installed."
-    echo "Starting ${SERVICE}..."
-    systemctl start "${SERVICE}"
+    tun_resolve "${1:-}"
+    echo "Starting ${TUNIT}..."
+    systemctl start "${TUNIT}"
     sleep 2
-    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
+    if systemctl is-active "${TUNIT}" >/dev/null 2>&1; then
         echo "$(color_ok "Service started.")"
     else
         echo "$(color_err "Service failed to start.")"
-        journalctl -u "${SERVICE}" -n 20 --no-pager >&2
+        journalctl -u "${TUNIT}" -n 20 --no-pager >&2
         exit 1
     fi
 }
 
 cmd_stop() {
     need_root
-    echo "Stopping ${SERVICE}..."
-    systemctl stop "${SERVICE}"
+    tun_resolve "${1:-}"
+    echo "Stopping ${TUNIT}..."
+    systemctl stop "${TUNIT}"
     echo "$(color_ok "Service stopped.")"
 }
 
 cmd_restart() {
     need_root
-    is_installed || die "spoof-tunnel is not installed."
-    echo "Restarting ${SERVICE}..."
-    systemctl restart "${SERVICE}"
+    tun_resolve "${1:-}"
+    echo "Restarting ${TUNIT}..."
+    systemctl restart "${TUNIT}"
     sleep 2
-    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
+    if systemctl is-active "${TUNIT}" >/dev/null 2>&1; then
         echo "$(color_ok "Service restarted.")"
     else
         echo "$(color_err "Service failed to restart.")"
-        journalctl -u "${SERVICE}" -n 20 --no-pager >&2
+        journalctl -u "${TUNIT}" -n 20 --no-pager >&2
         exit 1
     fi
+}
+
+# ── config regeneration ──────────────────────────────────────────────────────
+
+# Regenerate the resolved tunnel's env file from its YAML. Runs the sibling
+# collision checks in config-parse.py, so it fails rather than writing a config
+# that would clash with another tunnel on this host.
+regen_env() {
+    local args=(--output "$TENV")
+    [ -n "$TUNNEL" ] && args+=(--instance "$TUNNEL" --tunnels-dir "$TUNNELS_DIR")
+    python3 "${LIB_DIR}/config-parse.py" "${args[@]}" "$TCONF" || return 1
+    chmod 640 "$TENV"
 }
 
 # ── edit config ──────────────────────────────────────────────────────────────
 
 cmd_edit_config() {
     need_root
-    [ -f "$CONF_YAML" ] || die "Config file not found: ${CONF_YAML}"
-    EDITOR="${EDITOR:-$(command -v nano 2>/dev/null || command -v vi 2>/dev/null || true)}"
-    [ -n "${EDITOR}" ] || die "No editor found. Install nano or vi, or set \$EDITOR."
-    "$EDITOR" "$CONF_YAML"
+    tun_resolve "${1:-}"
+    [ -f "$TCONF" ] || die "Config file not found: ${TCONF}"
+    local ed="${EDITOR:-$(command -v nano 2>/dev/null || command -v vi 2>/dev/null || true)}"
+    [ -n "${ed}" ] || die "No editor found. Install nano or vi, or set \$EDITOR."
+    "$ed" "$TCONF"
     echo ""
-    read -rp "Apply changes now (regenerate tunnel.env and restart)? [y/N] " yn || true
+    read -rp "Apply changes now (regenerate env and restart)? [y/N] " yn || true
     case "${yn,,}" in
         y|yes)
             echo "Regenerating config..."
-            python3 "${LIB_DIR}/config-parse.py" \
-                --output "${ENV_FILE}" "${CONF_YAML}"
-            cmd_restart
+            regen_env
+            cmd_restart "$TUNNEL"
             ;;
         *)
-            echo "Config saved. Restart manually with: spoofctl restart"
+            echo "Config saved. Restart manually with: spoofctl restart ${TUNNEL}"
             ;;
     esac
 }
@@ -194,8 +405,10 @@ cmd_edit_config() {
 
 cmd_spoof_ips() {
     need_root
+    tun_resolve "${1:-}"
     load_env
     echo ""
+    echo "  Tunnel: ${TLABEL}"
     echo "  Current spoof IPs: ${SPOOF_IPS:-none}"
     echo ""
     echo "  Enter new comma-separated list, e.g.: 1.2.3.4,5.6.7.8"
@@ -203,39 +416,22 @@ cmd_spoof_ips() {
     NEW_IPS="${NEW_IPS// /}"
     [ -z "$NEW_IPS" ] && { echo "No change."; return; }
 
-    # Validate
-    VALID=""
+    local valid="" _ip
     IFS=',' read -ra _ARR <<< "$NEW_IPS"
     for _ip in "${_ARR[@]}"; do
         _ip="${_ip// /}"
         [ -z "$_ip" ] && continue
-        if python3 -c "import socket, sys; socket.inet_aton(sys.argv[1])" "$_ip" 2>/dev/null; then
-            VALID="${VALID:+$VALID,}${_ip}"
+        if python3 -c "import socket,sys; socket.inet_aton(sys.argv[1])" "$_ip" 2>/dev/null; then
+            valid="${valid:+$valid,}${_ip}"
         else
             echo "  WARNING: '$_ip' is invalid — skipping."
         fi
     done
-    [ -z "$VALID" ] && die "No valid IPs entered."
+    [ -z "$valid" ] && die "No valid IPs entered."
 
-    echo "  Setting SPOOF_IPS=${VALID}"
+    echo "  Setting spoof addresses to: ${valid}"
 
-    # Update tunnel.env
-    if grep -q '^SPOOF_IPS=' "$ENV_FILE"; then
-        sed -i "s|^SPOOF_IPS=.*|SPOOF_IPS=${VALID}|" "$ENV_FILE"
-    else
-        echo "SPOOF_IPS=${VALID}" >> "$ENV_FILE"
-    fi
-
-    # Update config.yaml addresses section
-    if [ -f "$CONF_YAML" ]; then
-        # Build replacement YAML block
-        ADDR_BLOCK=""
-        IFS=',' read -ra _ARR2 <<< "$VALID"
-        for _ip in "${_ARR2[@]}"; do
-            ADDR_BLOCK="${ADDR_BLOCK}  - ${_ip}"$'\n'
-        done
-        # Use python3 to safely rewrite the addresses list
-        python3 - "$CONF_YAML" "$VALID" << 'PYEOF'
+    python3 - "$TCONF" "$valid" << 'PYEOF'
 import sys, re
 path = sys.argv[1]
 ips  = [i.strip() for i in sys.argv[2].split(',') if i.strip()]
@@ -247,21 +443,24 @@ with open(path, 'w') as f:
     f.write(text)
 print("config.yaml updated.")
 PYEOF
-    fi
+
+    # Spoof IPs are an ExecStart argument, so the env file (and therefore
+    # EXTRA_ARGS) has to be rebuilt and the service restarted to take effect.
+    regen_env
 
     echo ""
     read -rp "  Restart service to apply? [Y/n] " yn || true
     case "${yn,,}" in
-        n|no) echo "  Restart manually: spoofctl restart" ;;
-        *)    cmd_restart ;;
+        n|no) echo "  Restart manually: spoofctl restart ${TUNNEL}" ;;
+        *)    cmd_restart "$TUNNEL" ;;
     esac
 }
 
-# ── port forwarding ─────────────────────────────────────────────────────────
+# ── port forwarding ──────────────────────────────────────────────────────────
 #
-# FORWARD_PORTS in tunnel.env is the source of truth for the running rules;
-# forwarding.ports in config.yaml is the source of truth across reinstalls.
-# Every mutation writes both, then reconciles iptables.
+# FORWARD_PORTS in the tunnel's env is the source of truth for the running
+# rules; forwarding.ports in its config.yaml is the source of truth across
+# reinstalls. Every mutation writes both, then reconciles iptables.
 
 # Forwarding only applies to client nodes.
 fwd_guard() {
@@ -273,7 +472,6 @@ fwd_guard() {
     return 0
 }
 
-# Validate one port. Echoes the normalised port on success.
 fwd_valid_port() {
     local p="${1// /}"
     [[ "$p" =~ ^[0-9]+$ ]] || return 1
@@ -281,18 +479,41 @@ fwd_valid_port() {
     printf '%s' "$p"
 }
 
-# Persist a comma-separated port list to tunnel.env and config.yaml.
+# Is this port claimed by a different tunnel on this host? Echoes a reason.
+# A port can only be DNAT'd once, and forwarding another tunnel's listen port
+# would hijack that tunnel's traffic.
+fwd_owner() {
+    local port="$1" f n other
+    [ -d "$TUNNELS_DIR" ] || return 0
+    for f in "${TUNNELS_DIR}"/*.env; do
+        [ -f "$f" ] || continue
+        n="$(basename "$f")"; n="${n%.env}"
+        [ "$n" = "$TUNNEL" ] && continue
+        other="$(env_get "$f" FORWARD_PORTS)"
+        if [[ ",${other}," == *",${port},"* ]]; then
+            echo "already forwarded by tunnel '${n}'"
+            return 0
+        fi
+        if [ "$(env_get "$f" LISTEN_PORT)" = "$port" ]; then
+            echo "the listen port of tunnel '${n}'"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Persist a comma-separated port list to the env file and config.yaml.
 fwd_persist() {
     local list="$1"
 
-    if grep -q '^FORWARD_PORTS=' "$ENV_FILE"; then
-        sed -i "s|^FORWARD_PORTS=.*|FORWARD_PORTS=${list}|" "$ENV_FILE"
+    if grep -q '^FORWARD_PORTS=' "$TENV"; then
+        sed -i "s|^FORWARD_PORTS=.*|FORWARD_PORTS=${list}|" "$TENV"
     else
-        echo "FORWARD_PORTS=${list}" >> "$ENV_FILE"
+        echo "FORWARD_PORTS=${list}" >> "$TENV"
     fi
 
-    [ -f "$CONF_YAML" ] || return 0
-    python3 - "$CONF_YAML" "$list" << 'PYEOF'
+    [ -f "$TCONF" ] || return 0
+    python3 - "$TCONF" "$list" << 'PYEOF'
 import sys, re
 path  = sys.argv[1]
 ports = [p.strip() for p in sys.argv[2].split(',') if p.strip()] if sys.argv[2] else []
@@ -318,13 +539,11 @@ with open(path, 'w') as f:
 PYEOF
 }
 
-# ── forward list ────────────────────────────────────────────────────────────
-
 cmd_forward_list() {
     load_env
     echo ""
     hr
-    printf "  Port forwarding — %s node\n" "${MODE:-unknown}"
+    printf "  Port forwarding — %s node  [%s]\n" "${MODE:-unknown}" "$TLABEL"
     hr
     if [ "${MODE:-}" = "server" ]; then
         echo "  Not applicable on a server node."
@@ -370,6 +589,7 @@ cmd_forward_list() {
     [ "$found" = "0" ] && echo "    (none)"
 
     # Shared rules that every per-port DNAT depends on for the return path.
+    # They are keyed by TUN device, so they belong to this tunnel alone.
     echo ""
     if iptables -t nat -C POSTROUTING -o "${TUN_NAME:-tun0}" -j MASQUERADE 2>/dev/null; then
         printf "  MASQUERADE on %s: %s\n" "${TUN_NAME:-tun0}" "$(color_ok "yes")"
@@ -379,8 +599,6 @@ cmd_forward_list() {
     hr
 }
 
-# ── forward add ─────────────────────────────────────────────────────────────
-
 cmd_forward_add() {
     need_root
     load_env
@@ -389,6 +607,7 @@ cmd_forward_add() {
     local input="${1:-}"
     if [ -z "$input" ]; then
         echo ""
+        echo "  Tunnel: ${TLABEL}"
         echo "  Current forwarded ports: ${FORWARD_PORTS:-none}"
         echo "  Enter one or more ports to ADD (comma-separated). TCP+UDP both."
         read -rp "  Port(s) to add: " input || true
@@ -396,7 +615,7 @@ cmd_forward_add() {
     input="${input// /}"
     [ -z "$input" ] && { echo "  Nothing to add."; return; }
 
-    local list="${FORWARD_PORTS:-}" added="" _raw _p
+    local list="${FORWARD_PORTS:-}" added="" _raw _p owner
     IFS=',' read -ra _ARR <<< "$input"
     for _raw in "${_ARR[@]}"; do
         [ -z "${_raw// /}" ] && continue
@@ -405,11 +624,16 @@ cmd_forward_add() {
             continue
         fi
         if [ "$_p" = "${LISTEN_PORT:-}" ]; then
-            echo "  WARNING: ${_p} is the tunnel's own listen port — skipping."
+            echo "  WARNING: ${_p} is this tunnel's own listen port — skipping."
             continue
         fi
         if [[ ",${list}," == *",${_p},"* ]]; then
             echo "  Port ${_p} is already forwarded — skipping."
+            continue
+        fi
+        owner="$(fwd_owner "$_p")"
+        if [ -n "$owner" ]; then
+            echo "  WARNING: port ${_p} is ${owner} — skipping."
             continue
         fi
         list="${list:+$list,}${_p}"
@@ -423,15 +647,13 @@ cmd_forward_add() {
 
     # Install mode is idempotent (iptables -C before every insert), so this
     # only creates rules for the ports that are genuinely new.
-    "${FORWARD_HOOK}"
+    "${FORWARD_HOOK}" $(hook_arg)
 
     echo ""
     echo "  $(color_ok "Added: ${added}")"
     echo "  Forwarded ports: ${list}"
     echo "  No service restart required."
 }
-
-# ── forward del ─────────────────────────────────────────────────────────────
 
 cmd_forward_del() {
     need_root
@@ -446,6 +668,7 @@ cmd_forward_del() {
     local input="${1:-}"
     if [ -z "$input" ]; then
         echo ""
+        echo "  Tunnel: ${TLABEL}"
         echo "  Currently forwarded: ${FORWARD_PORTS}"
         echo "  Enter one or more ports to REMOVE (comma-separated),"
         echo "  or 'all' to remove every forwarding rule."
@@ -455,7 +678,7 @@ cmd_forward_del() {
     [ -z "$input" ] && { echo "  Nothing to remove."; return; }
 
     if [ "${input,,}" = "all" ]; then
-        "${FORWARD_HOOK}" --remove || true
+        "${FORWARD_HOOK}" --remove $(hook_arg) || true
         fwd_persist ""
         export FORWARD_PORTS=""
         echo ""
@@ -491,11 +714,13 @@ cmd_forward_del() {
     done
 
     if [ -z "$keep" ]; then
-        # Last port removed — tear down the shared FORWARD/MASQUERADE rules too.
-        "${FORWARD_HOOK}" --remove || true
+        # Last port removed — tear down this tunnel's shared FORWARD and
+        # MASQUERADE rules too. They are keyed by its TUN device, so no other
+        # tunnel depends on them.
+        "${FORWARD_HOOK}" --remove $(hook_arg) || true
     else
         for _d in "${to_remove[@]}"; do
-            "${FORWARD_HOOK}" --remove-port "$_d" || true
+            "${FORWARD_HOOK}" --remove-port "$_d" $(hook_arg) || true
         done
     fi
 
@@ -508,8 +733,6 @@ cmd_forward_del() {
     echo "  No service restart required."
 }
 
-# ── forward replace (the old full-list behaviour) ───────────────────────────
-
 cmd_forward_replace() {
     need_root
     load_env
@@ -518,6 +741,7 @@ cmd_forward_replace() {
     local input="${1:-}"
     if [ -z "$input" ]; then
         echo ""
+        echo "  Tunnel: ${TLABEL}"
         echo "  Current forwarded ports: ${FORWARD_PORTS:-none}"
         echo "  Peer TUN IP:             ${PEER_TUN:-10.100.100.1}"
         echo ""
@@ -529,35 +753,38 @@ cmd_forward_replace() {
     fi
     input="${input// /}"
 
-    local valid="" _raw _p
+    local valid="" _raw _p owner
     if [ -n "$input" ]; then
         IFS=',' read -ra _ARR <<< "$input"
         for _raw in "${_ARR[@]}"; do
             [ -z "${_raw// /}" ] && continue
-            if _p="$(fwd_valid_port "$_raw")"; then
-                [[ ",${valid}," == *",${_p},"* ]] && continue
-                valid="${valid:+$valid,}${_p}"
-            else
+            if ! _p="$(fwd_valid_port "$_raw")"; then
                 echo "  WARNING: '${_raw}' is not a valid port (1–65535) — skipping."
+                continue
             fi
+            [[ ",${valid}," == *",${_p},"* ]] && continue
+            owner="$(fwd_owner "$_p")"
+            if [ -n "$owner" ]; then
+                echo "  WARNING: port ${_p} is ${owner} — skipping."
+                continue
+            fi
+            valid="${valid:+$valid,}${_p}"
         done
     fi
 
     echo "  Setting FORWARD_PORTS=${valid:-<empty>}"
 
     # Remove the old rule set before applying the new one.
-    "${FORWARD_HOOK}" --remove 2>/dev/null || true
+    "${FORWARD_HOOK}" --remove $(hook_arg) 2>/dev/null || true
 
     fwd_persist "$valid"
     export FORWARD_PORTS="$valid"
 
-    [ -n "$valid" ] && "${FORWARD_HOOK}"
+    [ -n "$valid" ] && "${FORWARD_HOOK}" $(hook_arg)
 
     echo ""
     echo "  Forwarding rules applied. No service restart required."
 }
-
-# ── forward apply ───────────────────────────────────────────────────────────
 
 # Re-install the rules for the configured port list — after a manual iptables
 # flush, or when the list was edited through 'edit-config'.
@@ -569,16 +796,15 @@ cmd_forward_apply() {
         echo "  No ports configured — nothing to apply."
         return
     fi
-    "${FORWARD_HOOK}"
+    "${FORWARD_HOOK}" $(hook_arg)
     echo ""
     echo "  $(color_ok "Rules re-applied for: ${FORWARD_PORTS}")"
 }
 
-# ── forward dispatcher ──────────────────────────────────────────────────────
-
 cmd_forward() {
-    is_installed || die "No tunnel is configured on this host. Run: spoofctl create"
+    has_tunnel || die "No tunnel is configured on this host. Run: spoofctl create"
     local sub="${1:-list}"
+    tun_resolve "${OPT_TUNNEL:-}"
     case "$sub" in
         list|ls)        cmd_forward_list ;;
         add)            cmd_forward_add "${2:-}" ;;
@@ -591,10 +817,12 @@ cmd_forward() {
 
 menu_forward() {
     local FC
+    has_tunnel || { echo "  No tunnel is configured. Create one first."; return; }
+    tun_resolve "${MENU_TUNNEL:-}"
     while true; do
         echo ""
         hr
-        echo "  Port Forwarding"
+        printf "  Port Forwarding  [%s]\n" "$TLABEL"
         hr
         echo "  1) List forwarded ports"
         echo "  2) Add a port"
@@ -618,295 +846,29 @@ menu_forward() {
     done
 }
 
-# ── update ────────────────────────────────────────────────────────────────────
-
-cmd_update() {
-    need_root
-
-    # Load repo URL
-    REPO_URL=""
-    [ -f "$UPDATE_CONF" ] && source "$UPDATE_CONF" 2>/dev/null || true
-    if [ -z "${REPO_URL:-}" ]; then
-        echo ""
-        echo "  Repository URL not configured."
-        read -rp "  GitHub repo URL (e.g. https://github.com/imanxboy/spoof-tunnel): " REPO_URL || true
-        [ -z "$REPO_URL" ] && die "Repo URL required."
-        echo "REPO_URL=${REPO_URL}" > "$UPDATE_CONF"
-    fi
-
-    GH_REPO="${REPO_URL#https://github.com/}"
-    API="https://api.github.com/repos/${GH_REPO}/releases/latest"
-
-    echo ""
-    echo "  Checking for latest release..."
-    if command -v curl >/dev/null 2>&1; then
-        RELEASE=$(curl -fsSL "$API" 2>/dev/null)
-    else
-        RELEASE=$(wget -qO- "$API" 2>/dev/null)
-    fi
-
-    TAG=$(echo "$RELEASE" | python3 -c \
-        "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name',''))" \
-        2>/dev/null || true)
-    TARBALL_URL=$(echo "$RELEASE" | python3 -c \
-        "import sys,json; d=json.load(sys.stdin); print(d.get('tarball_url',''))" \
-        2>/dev/null || true)
-
-    [ -z "$TAG" ]         && die "Could not fetch release info from: $API"
-    [ -z "$TARBALL_URL" ] && die "No tarball URL in release."
-
-    # Current version
-    CURRENT_VER="unknown"
-    [ -f "${CONF_DIR}/VERSION" ] && CURRENT_VER=$(cat "${CONF_DIR}/VERSION")
-
-    echo "  Current:  ${CURRENT_VER}"
-    echo "  Latest:   ${TAG}"
-
-    if [ "$CURRENT_VER" = "$TAG" ]; then
-        echo "  Already up to date."
-        return
-    fi
-
-    echo ""
-    read -rp "  Update to ${TAG}? [Y/n] " yn || true
-    case "${yn,,}" in n|no) echo "Aborted."; return ;; esac
-
-    # Create rollback snapshot before updating
-    echo ""
-    echo "  Creating rollback snapshot..."
-    SNAP_DIR="${BACKUP_DIR}/pre-update-${TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
-    mkdir -p "$SNAP_DIR"
-    [ -f "$BIN" ]       && cp "$BIN"       "${SNAP_DIR}/spoof-tunnel"
-    [ -f "$ENV_FILE" ]  && cp "$ENV_FILE"  "${SNAP_DIR}/tunnel.env"
-    [ -f "$CONF_YAML" ] && cp "$CONF_YAML" "${SNAP_DIR}/config.yaml"
-    echo "  Snapshot saved: ${SNAP_DIR}"
-
-    # Download and extract
-    WORK_DIR=$(mktemp -d)
-    trap 'rm -rf "${WORK_DIR}"' EXIT
-    echo "  Downloading ${TAG}..."
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$TARBALL_URL" | tar xz -C "$WORK_DIR" --strip-components=1
-    else
-        wget -qO- "$TARBALL_URL"  | tar xz -C "$WORK_DIR" --strip-components=1
-    fi
-
-    # Build
-    PKG_DIR="$WORK_DIR"
-    if [ -f "${PKG_DIR}/build.sh" ]; then
-        echo "  Building new binary..."
-        bash "${PKG_DIR}/build.sh"
-    elif [ ! -f "${PKG_DIR}/bin/spoof-tunnel" ]; then
-        die "No binary and no build.sh in release."
-    fi
-
-    # Install — run the full installer with --no-start so it regenerates the
-    # service unit (and therefore ExecStartPost lines) without starting the
-    # service prematurely.  The binary and libexec hooks are installed by
-    # install.sh; spoofctl itself is updated separately below.
-    echo "  Installing..."
-    cp -f "${CONF_YAML}" "${PKG_DIR}/config.yaml"
-    bash "${PKG_DIR}/install.sh" --no-start
-
-    # Self-update spoofctl — install.sh does not install it (only scripts/install.sh does).
-    if [ -f "${PKG_DIR}/scripts/spoofctl" ]; then
-        install -m 755 -o root -g root \
-            "${PKG_DIR}/scripts/spoofctl" /usr/local/bin/spoofctl
-        echo "  Updated: /usr/local/bin/spoofctl"
-    fi
-
-    echo "$TAG" > "${CONF_DIR}/VERSION"
-
-    # Restart and health-check
-    echo "  Restarting service..."
-    systemctl restart "${SERVICE}"
-    sleep 3
-    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
-        echo "  $(color_ok "Update successful: ${TAG}")"
-        return
-    fi
-
-    # Auto-rollback
-    echo "  $(color_err "Service failed after update — rolling back...")"
-    cp -f "${SNAP_DIR}/spoof-tunnel" "$BIN"
-    systemctl restart "${SERVICE}"
-    sleep 2
-    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
-        echo "  $(color_warn "Rolled back to previous version. Service is running.")"
-    else
-        echo "  $(color_err "Rollback also failed. Manual intervention required.")"
-        journalctl -u "${SERVICE}" -n 30 --no-pager >&2
-    fi
-    exit 1
-}
-
-# ── rollback ─────────────────────────────────────────────────────────────────
-
-cmd_rollback() {
-    need_root
-
-    if [ ! -d "$BACKUP_DIR" ]; then
-        die "No backup directory found: ${BACKUP_DIR}"
-    fi
-
-    echo ""
-    echo "  Available rollback snapshots:"
-    echo ""
-    SNAPS=()
-    i=1
-    while IFS= read -r d; do
-        SNAPS+=("$d")
-        printf "    %2d) %s\n" "$i" "$(basename "$d")"
-        (( i++ )) || true
-    done < <(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d | sort -r)
-
-    [ "${#SNAPS[@]}" -eq 0 ] && die "No snapshots found in ${BACKUP_DIR}."
-
-    echo ""
-    read -rp "  Select snapshot [1]: " IDX || true
-    IDX="${IDX:-1}"
-    [[ "$IDX" =~ ^[0-9]+$ ]] || die "Invalid selection."
-    [ "$IDX" -ge 1 ] && [ "$IDX" -le "${#SNAPS[@]}" ] || die "Out of range."
-    SNAP="${SNAPS[$((IDX-1))]}"
-
-    echo ""
-    echo "  Will restore from: $(basename "$SNAP")"
-    read -rp "  Confirm? [y/N] " yn || true
-    case "${yn,,}" in y|yes) ;; *) echo "Aborted."; return ;; esac
-
-    # Stop service
-    echo "  Stopping service..."
-    systemctl stop "${SERVICE}" 2>/dev/null || true
-
-    # Restore binary
-    [ -f "${SNAP}/spoof-tunnel" ] && \
-        install -m 755 "${SNAP}/spoof-tunnel" "$BIN" && \
-        echo "  Binary restored."
-
-    # Restore config (optional)
-    if [ -f "${SNAP}/config.yaml" ]; then
-        read -rp "  Restore config.yaml too? [y/N] " yn2 || true
-        case "${yn2,,}" in
-            y|yes)
-                cp -f "${SNAP}/config.yaml" "$CONF_YAML"
-                cp -f "${SNAP}/tunnel.env"  "$ENV_FILE" 2>/dev/null || true
-                echo "  Config restored."
-                ;;
-        esac
-    fi
-
-    echo "  Restarting service..."
-    systemctl start "${SERVICE}"
-    sleep 2
-    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
-        echo "  $(color_ok "Rollback complete. Service is running.")"
-    else
-        echo "  $(color_err "Service failed to start after rollback.")"
-        journalctl -u "${SERVICE}" -n 20 --no-pager >&2
-        exit 1
-    fi
-}
-
-# ── delete tunnel ───────────────────────────────────────────────────────────
-
-# Remove the tunnel that was set up on this host without removing the tooling.
+# ── systemd units ────────────────────────────────────────────────────────────
 #
-# Deleted: the systemd unit's enablement, every iptables rule the tunnel owns,
-#          the TUN device, config.yaml and tunnel.env (backed up first).
-# Kept:    the spoof-tunnel binary, spoofctl, the libexec hooks and the logs,
-#          so a new tunnel can be created straight away with 'spoofctl create'.
+# KEEP IN SYNC with the unit writers in install.sh — the three must produce
+# byte-identical files for the same inputs.
 #
-# Use 'spoofctl uninstall' to remove the tooling itself as well.
+# The template unit is shared by every instance, so it cannot bake in
+# per-tunnel ExecStart flags. Those come from $EXTRA_ARGS in the instance's env
+# file (unbraced, so systemd splits it into words). WatchdogSec cannot be an
+# environment expansion at all, so it goes in a per-instance drop-in.
 
-cmd_delete() {
-    need_root
-    has_tunnel || die "No tunnel is configured on this host. Nothing to delete."
-    load_env
-
-    echo ""
-    hr
-    echo "  Delete tunnel"
-    hr
-    printf "  Role:      %s\n" "${MODE:-unknown}"
-    printf "  Peer:      %s:%s\n" "${PEER_IP:-?}" "${PEER_PORT:-2080}"
-    printf "  TUN:       %s  (%s ↔ %s)\n" \
-        "${TUN_NAME:-tun0}" "${LOCAL_TUN:-?}" "${PEER_TUN:-?}"
-    printf "  Forwarded: %s\n" "${FORWARD_PORTS:-none}"
-    printf "  Service:   %s\n" "$(svc_state)"
-    hr
-    echo ""
-    echo "  $(color_warn "The tunnel config will be removed. The binary, spoofctl and")"
-    echo "  $(color_warn "the hooks stay installed so you can create a new tunnel.")"
-    echo ""
-    read -rp "  Type 'delete' to confirm: " yn || true
-    [ "$yn" = "delete" ] || { echo "  Aborted."; return; }
-
-    echo ""
-    echo "  Stopping service..."
-    systemctl stop    "${SERVICE}" 2>/dev/null || true
-    systemctl disable "${SERVICE}" 2>/dev/null || true
-
-    # Prometheus export timer, if this tunnel enabled one.
-    if systemctl list-unit-files 2>/dev/null | grep -q '^spoof-tunnel-prom.timer'; then
-        systemctl stop    spoof-tunnel-prom.timer 2>/dev/null || true
-        systemctl disable spoof-tunnel-prom.timer 2>/dev/null || true
-        echo "  Stopped Prometheus export timer."
-    fi
-
-    echo "  Removing iptables rules..."
-    if [ -x "${FORWARD_HOOK}" ] && [ -f "${ENV_FILE}" ]; then
-        "${FORWARD_HOOK}" --remove 2>/dev/null || true
-    fi
-    drop_input_rule "${LISTEN_PORT:-}"
-
-    del_tun_device "${TUN_NAME:-tun0}"
-
-    # Back the config up before deleting it — recreating a tunnel by hand from
-    # a remembered peer IP and spoof list is exactly the mistake worth avoiding.
-    SNAP_DIR="${BACKUP_DIR}/deleted-$(date -u +%Y%m%dT%H%M%SZ)"
-    mkdir -p "$SNAP_DIR"
-    [ -f "$CONF_YAML" ] && cp "$CONF_YAML" "${SNAP_DIR}/config.yaml"
-    [ -f "$ENV_FILE" ]  && cp "$ENV_FILE"  "${SNAP_DIR}/tunnel.env"
-    chmod 600 "${SNAP_DIR}"/* 2>/dev/null || true
-    echo "  Config backed up: ${SNAP_DIR}"
-
-    rm -f "$CONF_YAML" "$ENV_FILE"
-    rm -f "$HEALTH_JSON"
-
-    systemctl daemon-reload
-
-    echo ""
-    echo "  $(color_ok "Tunnel deleted.")"
-    echo ""
-    echo "  Create a new one:  spoofctl create"
-    echo "  Remove everything: spoofctl uninstall"
-}
-
-# ── create tunnel ───────────────────────────────────────────────────────────
-
-# Regenerate /etc/systemd/system/spoof-tunnel.service from tunnel.env.
-#
-# KEEP IN SYNC with the unit written by install.sh — the two must produce the
-# same file. install.sh bakes a few values into the unit at install time
-# (--spoof-ips, --json-metrics, WatchdogSec), so a tunnel created with a
-# different role or spoof list needs the unit rewritten, not just reloaded.
-regen_unit() {
-    local watchdog_line="" exec_spoof="" exec_json=""
-    [ "${WATCHDOG_SEC:-0}" -gt 0 ] && watchdog_line="WatchdogSec=${WATCHDOG_SEC}"
-    [ -n "${SPOOF_IPS:-}" ] && exec_spoof=' --spoof-ips ${SPOOF_IPS}'
-    [ "${JSON_METRICS:-false}" = "true" ] && exec_json=' --json-metrics'
-
-    cat > "${SERVICE_FILE}" << EOF
+write_template_unit() {
+    cat > "${TEMPLATE_UNIT_FILE}" << EOF
 [Unit]
-Description=spoof-tunnel-v6 IP tunnel
+Description=spoof-tunnel-v6 IP tunnel (%i)
 After=network.target
 Wants=network.target
 
 [Service]
 Type=notify
-EnvironmentFile=/etc/spoof-tunnel/tunnel.env
-ExecStartPre=${PREPARE_HOOK}
+EnvironmentFile=${TUNNELS_DIR}/%i.env
+ExecStartPre=${PREPARE_HOOK} %i
 ExecStart=${BIN} \\
+    --name %i \\
     --mode \${MODE} \\
     --outer \${OUTER} \\
     --iface \${IFACE} \\
@@ -926,12 +888,11 @@ ExecStart=${BIN} \\
     --failover-loss \${FAILOVER_LOSS} \\
     --failover-intervals \${FAILOVER_INTERVALS} \\
     --metric-interval \${METRIC_INTERVAL} \\
-    --watchdog-sec \${WATCHDOG_SEC}${exec_spoof}${exec_json}
-ExecStartPost=${QDISC_HOOK}
-ExecStartPost=${FORWARD_HOOK}
+    --watchdog-sec \${WATCHDOG_SEC} \$EXTRA_ARGS
+ExecStartPost=${QDISC_HOOK} %i
+ExecStartPost=${FORWARD_HOOK} %i
 Restart=always
 RestartSec=2
-${watchdog_line}
 StandardOutput=journal
 StandardError=journal
 LimitNOFILE=1048576
@@ -944,64 +905,640 @@ WantedBy=multi-user.target
 EOF
 }
 
-# Set up a new tunnel on a host where the tooling is already installed — the
-# other half of 'spoofctl delete'.
+# WatchdogSec is not expandable from the environment, so each instance carries
+# it in a drop-in over the shared template.
+write_instance_dropin() {
+    local name="$1" watchdog="$2"
+    local dir="${SYSTEMD_DIR}/spoof-tunnel@${name}.service.d"
+    mkdir -p "$dir"
+    if [ "${watchdog:-0}" -gt 0 ] 2>/dev/null; then
+        printf '[Service]\nWatchdogSec=%s\n' "$watchdog" > "${dir}/watchdog.conf"
+    else
+        printf '[Service]\nWatchdogSec=0\n' > "${dir}/watchdog.conf"
+    fi
+}
+
+remove_instance_dropin() {
+    rm -rf "${SYSTEMD_DIR}/spoof-tunnel@${1}.service.d"
+}
+
+# ── teardown primitives ──────────────────────────────────────────────────────
+
+# Remove the INPUT DROP rule that spoof-tunnel-prepare installs for the outer
+# UDP port. Nothing else removes it, so 'delete' and 'uninstall' both call this
+# — otherwise the port stays black-holed after the tunnel is gone.
+drop_input_rule() {
+    local port="${1:-}"
+    [ -n "$port" ] || return 0
+    local n=0
+    while iptables -C INPUT -p udp --dport "$port" -j DROP 2>/dev/null; do
+        iptables -D INPUT -p udp --dport "$port" -j DROP
+        n=$(( n + 1 ))
+    done
+    [ "$n" -gt 0 ] && echo "  Removed INPUT DROP rule for udp/${port}."
+    return 0
+}
+
+# Tear down the TUN device. The tunnel process normally removes it on exit, but
+# a killed process (or a crash) leaves it behind and blocks a clean re-create.
+del_tun_device() {
+    local tun="${1:-}"
+    [ -n "$tun" ] || return 0
+    if ip link show "$tun" >/dev/null 2>&1; then
+        ip link set "$tun" down 2>/dev/null || true
+        ip link delete "$tun" 2>/dev/null || true
+        echo "  Removed TUN device: ${tun}"
+    fi
+    return 0
+}
+
+# ── delete tunnel ────────────────────────────────────────────────────────────
+#
+# Remove one tunnel without removing the tooling.
+#
+# Deleted: the unit's enablement, every iptables rule this tunnel owns, its TUN
+#          device, its config and env (backed up first), its drop-in.
+# Kept:    the binary, spoofctl, the libexec hooks, the logs, and every other
+#          tunnel on the host.
+
+cmd_delete() {
+    need_root
+    has_tunnel || die "No tunnel is configured on this host. Nothing to delete."
+    tun_resolve "${1:-}"
+    load_env
+
+    echo ""
+    hr
+    printf "  Delete tunnel: %s\n" "$TLABEL"
+    hr
+    printf "  Role:      %s\n" "${MODE:-unknown}"
+    printf "  Peer:      %s:%s\n" "${PEER_IP:-?}" "${PEER_PORT:-2080}"
+    printf "  TUN:       %s  (%s ↔ %s)\n" \
+        "${TUN_NAME:-tun0}" "${LOCAL_TUN:-?}" "${PEER_TUN:-?}"
+    printf "  Forwarded: %s\n" "${FORWARD_PORTS:-none}"
+    printf "  Service:   %s (%s)\n" "$(svc_state)" "$TUNIT"
+    hr
+    echo ""
+    if [ -n "$TUNNEL" ]; then
+        local remaining=$(( $(tunnel_count) - 1 ))
+        echo "  $(color_warn "This tunnel will be removed. ${remaining} other tunnel(s) stay untouched.")"
+    else
+        echo "  $(color_warn "The tunnel config will be removed. The binary, spoofctl and")"
+        echo "  $(color_warn "the hooks stay installed so you can create a new tunnel.")"
+    fi
+    echo ""
+    read -rp "  Type 'delete' to confirm: " yn || true
+    [ "$yn" = "delete" ] || { echo "  Aborted."; return; }
+
+    echo ""
+    echo "  Stopping service..."
+    systemctl stop    "${TUNIT}" 2>/dev/null || true
+    systemctl disable "${TUNIT}" 2>/dev/null || true
+
+    # The Prometheus timer is host-wide; only stop it when nothing is left.
+    if [ "$(tunnel_count)" -le 1 ] && \
+       systemctl list-unit-files 2>/dev/null | grep -q '^spoof-tunnel-prom.timer'; then
+        systemctl stop    spoof-tunnel-prom.timer 2>/dev/null || true
+        systemctl disable spoof-tunnel-prom.timer 2>/dev/null || true
+        echo "  Stopped Prometheus export timer."
+    fi
+
+    echo "  Removing iptables rules..."
+    if [ -x "${FORWARD_HOOK}" ] && [ -f "${TENV}" ]; then
+        "${FORWARD_HOOK}" --remove $(hook_arg) 2>/dev/null || true
+    fi
+    drop_input_rule "${LISTEN_PORT:-}"
+
+    del_tun_device "${TUN_NAME:-}"
+
+    # Back the config up before deleting it — recreating a tunnel by hand from
+    # a remembered peer IP and spoof list is exactly the mistake worth avoiding.
+    local snap="${BACKUP_DIR}/deleted-${TUNNEL:-legacy}-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$snap"
+    [ -f "$TCONF" ] && cp "$TCONF" "${snap}/config.yaml"
+    [ -f "$TENV" ]  && cp "$TENV"  "${snap}/tunnel.env"
+    chmod 600 "${snap}"/* 2>/dev/null || true
+    echo "  Config backed up: ${snap}"
+
+    rm -f "$TCONF" "$TENV" "$THEALTH"
+    if [ -n "$TUNNEL" ]; then
+        remove_instance_dropin "$TUNNEL"
+        rmdir "${RUN_DIR}/${TUNNEL}" 2>/dev/null || true
+    fi
+
+    systemctl daemon-reload
+
+    echo ""
+    echo "  $(color_ok "Tunnel deleted.")"
+    echo ""
+    if [ "$(tunnel_count)" -gt 0 ]; then
+        echo "  Remaining tunnels:"
+        print_tunnel_table
+    else
+        echo "  Create a new one:  spoofctl create"
+        echo "  Remove everything: spoofctl uninstall"
+    fi
+}
+
+# ── create tunnel ────────────────────────────────────────────────────────────
+
 cmd_create() {
     need_root
     toolchain_present || \
         die "spoof-tunnel is not installed on this host. Run the installer first."
 
-    if has_tunnel; then
+    if [ "$(host_mode)" = "legacy" ]; then
         echo ""
-        echo "  $(color_warn "A tunnel is already configured on this host:")"
-        load_env
-        printf "    %s → %s:%s  (%s)\n" \
-            "${MODE:-?}" "${PEER_IP:-?}" "${PEER_PORT:-?}" "$(svc_state)"
+        echo "  $(color_warn "This host still has the original single-tunnel layout.")"
         echo ""
-        echo "  Delete it first with 'spoofctl delete', or change it in place"
-        echo "  with 'spoofctl edit-config'."
+        echo "  Convert it before adding a second tunnel:"
+        echo "      spoofctl migrate"
+        echo ""
+        echo "  That gives the existing tunnel a name and moves it onto the"
+        echo "  spoof-tunnel@<name> unit, rolling back if it fails to come up."
         return 1
     fi
 
+    local name="${1:-}"
+    if [ -z "$name" ]; then
+        echo ""
+        echo "  Name for the new tunnel (lowercase letters, digits, - or _)."
+        echo "  Examples: main, de1, fr-backup"
+        read -rp "  Name: " name || true
+    fi
+    name="${name// /}"
+    valid_name "$name" || \
+        die "Invalid tunnel name '${name}': 1-16 characters, lowercase letters, digits, '-' or '_'."
+
+    mkdir -p "$TUNNELS_DIR"
+    [ -f "${TUNNELS_DIR}/${name}.yaml" ] && \
+        die "A tunnel named '${name}' already exists. Pick another name, or delete it first."
+
     [ -x "$WIZARD" ] || die "Setup wizard not found at ${WIZARD}.
        It ships with the installer — run 'spoofctl update' to pull it in,
-       or write ${CONF_YAML} by hand and run 'spoofctl create' again."
-
-    mkdir -p "$CONF_DIR"
+       or write ${TUNNELS_DIR}/${name}.yaml by hand and run 'spoofctl create' again."
 
     echo ""
-    echo "  Starting the setup wizard..."
+    echo "  Starting the setup wizard for '${name}'..."
     echo ""
-    bash "$WIZARD" --output "$CONF_YAML"
-    [ -f "$CONF_YAML" ] || die "Wizard did not produce ${CONF_YAML}. Aborted."
-    chmod 640 "$CONF_YAML"
+    # The wizard reads the existing instances so it can offer a free TUN name,
+    # TUN subnet and listen port.
+    ST_TUNNELS_DIR="$TUNNELS_DIR" ST_INSTANCE="$name" \
+        bash "$WIZARD" --output "${TUNNELS_DIR}/${name}.yaml"
+    [ -f "${TUNNELS_DIR}/${name}.yaml" ] || \
+        die "Wizard did not produce ${TUNNELS_DIR}/${name}.yaml. Aborted."
+    chmod 640 "${TUNNELS_DIR}/${name}.yaml"
+
+    TUNNEL="$name"
+    TCONF="${TUNNELS_DIR}/${name}.yaml"
+    TENV="${TUNNELS_DIR}/${name}.env"
+    TUNIT="spoof-tunnel@${name}"
+    THEALTH="${RUN_DIR}/${name}/health.json"
+    TLABEL="$name"
 
     echo ""
     echo "  Validating config..."
-    python3 "${LIB_DIR}/config-parse.py" --validate "$CONF_YAML" \
-        || die "config.yaml failed validation. Fix it with 'spoofctl edit-config'."
+    if ! python3 "${LIB_DIR}/config-parse.py" --validate \
+            --instance "$name" --tunnels-dir "$TUNNELS_DIR" "$TCONF"; then
+        rm -f "$TCONF"
+        die "Config failed validation — nothing was created. Run 'spoofctl create' again."
+    fi
 
-    python3 "${LIB_DIR}/config-parse.py" --output "$ENV_FILE" "$CONF_YAML"
-    chmod 640 "$ENV_FILE"
+    regen_env
 
     echo "  Writing service unit..."
     load_env
-    regen_unit
+    write_template_unit
+    write_instance_dropin "$name" "${WATCHDOG_SEC:-30}"
     systemctl daemon-reload
 
     echo "  Enabling and starting service..."
-    systemctl enable "${SERVICE}" >/dev/null 2>&1 || true
-    systemctl start  "${SERVICE}"
+    systemctl enable "${TUNIT}" >/dev/null 2>&1 || true
+    systemctl start  "${TUNIT}"
     sleep 3
 
-    if systemctl is-active "${SERVICE}" >/dev/null 2>&1; then
+    if systemctl is-active "${TUNIT}" >/dev/null 2>&1; then
         echo ""
-        echo "  $(color_ok "Tunnel created and running.")"
-        cmd_status
+        echo "  $(color_ok "Tunnel '${name}' created and running.")"
+        cmd_status "$name"
     else
         echo ""
         echo "  $(color_err "Service failed to start.")"
-        journalctl -u "${SERVICE}" -n 30 --no-pager >&2
+        journalctl -u "${TUNIT}" -n 30 --no-pager >&2
+        echo ""
+        echo "  The config is kept at ${TCONF}."
+        echo "  Fix it with 'spoofctl edit-config ${name}' or remove it with"
+        echo "  'spoofctl delete ${name}'."
+        exit 1
+    fi
+}
+
+# ── migrate ──────────────────────────────────────────────────────────────────
+#
+# Convert a legacy single-tunnel host to the instance layout. Explicit, never
+# automatic: 'update' leaves a legacy host exactly as it found it.
+#
+# On any failure the original unit, config and env are restored and the old
+# service is started again, so a failed migration leaves the tunnel running.
+
+cmd_migrate() {
+    need_root
+
+    case "$(host_mode)" in
+        multi)
+            echo "  This host already uses the multi-tunnel layout."
+            cmd_list
+            return
+            ;;
+        empty)
+            die "No tunnel is configured on this host — nothing to migrate."
+            ;;
+    esac
+
+    local name="${1:-}"
+    if [ -z "$name" ]; then
+        read -rp "  Name for the existing tunnel [main]: " name || true
+        name="${name:-main}"
+    fi
+    name="${name// /}"
+    valid_name "$name" || \
+        die "Invalid tunnel name '${name}': 1-16 characters, lowercase letters, digits, '-' or '_'."
+
+    local was_active=0
+    systemctl is-active spoof-tunnel >/dev/null 2>&1 && was_active=1
+
+    echo ""
+    hr
+    echo "  Migrate to the multi-tunnel layout"
+    hr
+    printf "  Existing tunnel:  %s:%s (%s)\n" \
+        "$(env_get "$LEGACY_ENV" PEER_IP)" \
+        "$(env_get "$LEGACY_ENV" PEER_PORT)" \
+        "$(env_get "$LEGACY_ENV" MODE)"
+    printf "  New name:         %s\n" "$name"
+    printf "  New unit:         spoof-tunnel@%s.service\n" "$name"
+    hr
+    echo ""
+    echo "  The tunnel restarts once. If it does not come back up, everything"
+    echo "  is rolled back automatically and the current unit is started again."
+    echo ""
+    read -rp "  Proceed? [y/N] " yn || true
+    case "${yn,,}" in y|yes) ;; *) echo "  Aborted."; return ;; esac
+
+    # 1. snapshot
+    local snap="${BACKUP_DIR}/pre-migrate-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$snap"
+    [ -f "$LEGACY_YAML" ]      && cp "$LEGACY_YAML"      "${snap}/config.yaml"
+    [ -f "$LEGACY_ENV" ]       && cp "$LEGACY_ENV"       "${snap}/tunnel.env"
+    [ -f "$LEGACY_UNIT_FILE" ] && cp "$LEGACY_UNIT_FILE" "${snap}/spoof-tunnel.service"
+    chmod 600 "${snap}"/* 2>/dev/null || true
+    echo ""
+    echo "  Snapshot saved: ${snap}"
+
+    # Restore everything this function touched and bring the old unit back.
+    migrate_rollback() {
+        echo "  $(color_err "Rolling back...")"
+        rm -f "${TUNNELS_DIR}/${name}.yaml" "${TUNNELS_DIR}/${name}.env"
+        rmdir "$TUNNELS_DIR" 2>/dev/null || true
+        remove_instance_dropin "$name"
+        systemctl disable "spoof-tunnel@${name}" 2>/dev/null || true
+        systemctl stop    "spoof-tunnel@${name}" 2>/dev/null || true
+        [ -f "${snap}/config.yaml" ]           && cp -f "${snap}/config.yaml" "$LEGACY_YAML"
+        [ -f "${snap}/tunnel.env" ]            && cp -f "${snap}/tunnel.env"  "$LEGACY_ENV"
+        [ -f "${snap}/spoof-tunnel.service" ]  && cp -f "${snap}/spoof-tunnel.service" "$LEGACY_UNIT_FILE"
+        systemctl daemon-reload
+        systemctl enable spoof-tunnel >/dev/null 2>&1 || true
+        if [ "$was_active" = "1" ]; then
+            systemctl start spoof-tunnel 2>/dev/null || true
+            sleep 2
+            if systemctl is-active spoof-tunnel >/dev/null 2>&1; then
+                echo "  $(color_warn "Rolled back. The original tunnel is running again.")"
+            else
+                echo "  $(color_err "Rollback restored the files but the service did not start.")"
+                echo "  $(color_err "Snapshot: ${snap}")"
+                journalctl -u spoof-tunnel -n 30 --no-pager >&2
+            fi
+        else
+            echo "  $(color_warn "Rolled back. The original tunnel was not running before, so it was left stopped.")"
+        fi
+    }
+
+    # 2. build the instance alongside the running tunnel
+    echo "  Creating instance '${name}'..."
+    mkdir -p "$TUNNELS_DIR"
+    cp "$LEGACY_YAML" "${TUNNELS_DIR}/${name}.yaml"
+    chmod 640 "${TUNNELS_DIR}/${name}.yaml"
+
+    TUNNEL="$name"
+    TCONF="${TUNNELS_DIR}/${name}.yaml"
+    TENV="${TUNNELS_DIR}/${name}.env"
+    TUNIT="spoof-tunnel@${name}"
+    THEALTH="${RUN_DIR}/${name}/health.json"
+    TLABEL="$name"
+
+    if ! regen_env; then
+        migrate_rollback
+        die "Could not generate ${TENV} from the existing config."
+    fi
+
+    load_env
+    write_template_unit
+    write_instance_dropin "$name" "${WATCHDOG_SEC:-30}"
+    systemctl daemon-reload
+
+    # 3. swap the units
+    echo "  Switching to ${TUNIT}..."
+    systemctl stop    spoof-tunnel 2>/dev/null || true
+    systemctl disable spoof-tunnel 2>/dev/null || true
+
+    # The old process may not have torn its TUN device down cleanly.
+    del_tun_device "${TUN_NAME:-}"
+
+    systemctl enable "${TUNIT}" >/dev/null 2>&1 || true
+    if ! systemctl start "${TUNIT}" 2>/dev/null; then
+        migrate_rollback
+        die "Migration failed: ${TUNIT} could not be started."
+    fi
+    sleep 3
+
+    if ! systemctl is-active "${TUNIT}" >/dev/null 2>&1; then
+        journalctl -u "${TUNIT}" -n 30 --no-pager >&2
+        migrate_rollback
+        die "Migration failed: ${TUNIT} did not stay up."
+    fi
+
+    # 4. commit — retire the legacy files
+    mv -f "$LEGACY_UNIT_FILE" "${LEGACY_UNIT_FILE}.pre-migrate" 2>/dev/null || true
+    rm -f "$LEGACY_YAML" "$LEGACY_ENV" "${RUN_DIR}/health.json"
+    systemctl daemon-reload
+
+    echo ""
+    echo "  $(color_ok "Migration complete. The tunnel now runs as ${TUNIT}.")"
+    echo ""
+    echo "  Old unit kept at: ${LEGACY_UNIT_FILE}.pre-migrate"
+    echo "  Snapshot kept at: ${snap}"
+    echo ""
+    echo "  You can now add more tunnels with: spoofctl create <name>"
+    cmd_list
+}
+
+# ── update ───────────────────────────────────────────────────────────────────
+
+cmd_update() {
+    need_root
+
+    local REPO_URL=""
+    [ -f "$UPDATE_CONF" ] && source "$UPDATE_CONF" 2>/dev/null || true
+    if [ -z "${REPO_URL:-}" ]; then
+        echo ""
+        echo "  Repository URL not configured."
+        read -rp "  GitHub repo URL (e.g. https://github.com/imanxboy/spoof-tunnel): " REPO_URL || true
+        [ -z "$REPO_URL" ] && die "Repo URL required."
+        echo "REPO_URL=${REPO_URL}" > "$UPDATE_CONF"
+    fi
+
+    local GH_REPO="${REPO_URL#https://github.com/}"
+    local API="https://api.github.com/repos/${GH_REPO}/releases/latest"
+
+    echo ""
+    echo "  Checking for latest release..."
+    local RELEASE
+    if command -v curl >/dev/null 2>&1; then
+        RELEASE=$(curl -fsSL "$API" 2>/dev/null)
+    else
+        RELEASE=$(wget -qO- "$API" 2>/dev/null)
+    fi
+
+    local TAG TARBALL_URL
+    TAG=$(echo "$RELEASE" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || true)
+    TARBALL_URL=$(echo "$RELEASE" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin).get('tarball_url',''))" 2>/dev/null || true)
+
+    [ -z "$TAG" ]         && die "Could not fetch release info from: $API"
+    [ -z "$TARBALL_URL" ] && die "No tarball URL in release."
+
+    local CURRENT_VER="unknown"
+    [ -f "${CONF_DIR}/VERSION" ] && CURRENT_VER=$(cat "${CONF_DIR}/VERSION")
+
+    echo "  Current:  ${CURRENT_VER}"
+    echo "  Latest:   ${TAG}"
+
+    if [ "$CURRENT_VER" = "$TAG" ]; then
+        echo "  Already up to date."
+        return
+    fi
+
+    echo ""
+    read -rp "  Update to ${TAG}? [Y/n] " yn || true
+    case "${yn,,}" in n|no) echo "Aborted."; return ;; esac
+
+    local MODE_NOW; MODE_NOW="$(host_mode)"
+
+    # Snapshot: the binary, every tunnel's config and env, and the unit files.
+    echo ""
+    echo "  Creating rollback snapshot..."
+    local SNAP_DIR="${BACKUP_DIR}/pre-update-${TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "${SNAP_DIR}"
+    [ -f "$BIN" ] && cp "$BIN" "${SNAP_DIR}/spoof-tunnel"
+    [ -f "$LEGACY_YAML" ]        && cp "$LEGACY_YAML"        "${SNAP_DIR}/config.yaml"
+    [ -f "$LEGACY_ENV" ]         && cp "$LEGACY_ENV"         "${SNAP_DIR}/tunnel.env"
+    [ -f "$LEGACY_UNIT_FILE" ]   && cp "$LEGACY_UNIT_FILE"   "${SNAP_DIR}/spoof-tunnel.service"
+    [ -f "$TEMPLATE_UNIT_FILE" ] && cp "$TEMPLATE_UNIT_FILE" "${SNAP_DIR}/spoof-tunnel@.service"
+    if [ -d "$TUNNELS_DIR" ]; then
+        mkdir -p "${SNAP_DIR}/tunnels"
+        cp "$TUNNELS_DIR"/* "${SNAP_DIR}/tunnels/" 2>/dev/null || true
+    fi
+    echo "  Snapshot saved: ${SNAP_DIR}"
+
+    local WORK_DIR; WORK_DIR=$(mktemp -d)
+    trap 'rm -rf "${WORK_DIR}"' EXIT
+    echo "  Downloading ${TAG}..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$TARBALL_URL" | tar xz -C "$WORK_DIR" --strip-components=1
+    else
+        wget -qO- "$TARBALL_URL"  | tar xz -C "$WORK_DIR" --strip-components=1
+    fi
+
+    local PKG_DIR="$WORK_DIR"
+    if [ -f "${PKG_DIR}/build.sh" ]; then
+        echo "  Building new binary..."
+        bash "${PKG_DIR}/build.sh"
+    elif [ ! -f "${PKG_DIR}/bin/spoof-tunnel" ]; then
+        die "No binary and no build.sh in release."
+    fi
+
+    echo "  Installing..."
+    if [ "$MODE_NOW" = "legacy" ]; then
+        # Keep the legacy host exactly as it is: install.sh regenerates the
+        # same single-tunnel unit from the same config. Migration to the
+        # instance layout is a separate, explicit step.
+        cp -f "${LEGACY_YAML}" "${PKG_DIR}/config.yaml"
+        bash "${PKG_DIR}/install.sh" --no-start
+    else
+        # Nothing host-wide depends on a single config here, so only the
+        # tooling and the template unit are (re)installed.
+        bash "${PKG_DIR}/install.sh" --tooling-only
+    fi
+
+    # Self-update spoofctl — install.sh does not install it.
+    if [ -f "${PKG_DIR}/scripts/spoofctl" ]; then
+        install -m 755 -o root -g root \
+            "${PKG_DIR}/scripts/spoofctl" /usr/local/bin/spoofctl
+        echo "  Updated: /usr/local/bin/spoofctl"
+    fi
+
+    echo "$TAG" > "${CONF_DIR}/VERSION"
+
+    # Restart whatever is configured and health-check it.
+    local failed=""
+    if [ "$MODE_NOW" = "legacy" ]; then
+        echo "  Restarting spoof-tunnel..."
+        systemctl restart spoof-tunnel
+        sleep 3
+        systemctl is-active spoof-tunnel >/dev/null 2>&1 || failed="spoof-tunnel"
+    else
+        local n
+        while IFS= read -r n; do
+            [ -z "$n" ] && continue
+            echo "  Restarting spoof-tunnel@${n}..."
+            systemctl restart "spoof-tunnel@${n}" 2>/dev/null || true
+            sleep 2
+            systemctl is-active "spoof-tunnel@${n}" >/dev/null 2>&1 || \
+                failed="${failed:+$failed }spoof-tunnel@${n}"
+        done < <(tunnel_names)
+    fi
+
+    if [ -z "$failed" ]; then
+        echo "  $(color_ok "Update successful: ${TAG}")"
+        return
+    fi
+
+    # Auto-rollback: restore the previous binary and unit files, restart.
+    echo "  $(color_err "Failed after update: ${failed} — rolling back...")"
+    [ -f "${SNAP_DIR}/spoof-tunnel" ] && cp -f "${SNAP_DIR}/spoof-tunnel" "$BIN"
+    [ -f "${SNAP_DIR}/spoof-tunnel.service" ] && \
+        cp -f "${SNAP_DIR}/spoof-tunnel.service" "$LEGACY_UNIT_FILE"
+    [ -f "${SNAP_DIR}/spoof-tunnel@.service" ] && \
+        cp -f "${SNAP_DIR}/spoof-tunnel@.service" "$TEMPLATE_UNIT_FILE"
+    systemctl daemon-reload
+
+    local still=""
+    if [ "$MODE_NOW" = "legacy" ]; then
+        systemctl restart spoof-tunnel 2>/dev/null || true
+        sleep 2
+        systemctl is-active spoof-tunnel >/dev/null 2>&1 || still="spoof-tunnel"
+    else
+        local m
+        while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            systemctl restart "spoof-tunnel@${m}" 2>/dev/null || true
+            sleep 2
+            systemctl is-active "spoof-tunnel@${m}" >/dev/null 2>&1 || \
+                still="${still:+$still }spoof-tunnel@${m}"
+        done < <(tunnel_names)
+    fi
+
+    if [ -z "$still" ]; then
+        echo "  $(color_warn "Rolled back to the previous version. Services are running.")"
+    else
+        echo "  $(color_err "Rollback also failed for: ${still}")"
+        echo "  $(color_err "Snapshot: ${SNAP_DIR}")"
+    fi
+    exit 1
+}
+
+# ── rollback ─────────────────────────────────────────────────────────────────
+
+cmd_rollback() {
+    need_root
+
+    [ -d "$BACKUP_DIR" ] || die "No backup directory found: ${BACKUP_DIR}"
+
+    echo ""
+    echo "  Available rollback snapshots:"
+    echo ""
+    local -a SNAPS=()
+    local i=1 d
+    while IFS= read -r d; do
+        SNAPS+=("$d")
+        printf "    %2d) %s\n" "$i" "$(basename "$d")"
+        i=$(( i + 1 ))
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d | sort -r)
+
+    [ "${#SNAPS[@]}" -eq 0 ] && die "No snapshots found in ${BACKUP_DIR}."
+
+    echo ""
+    local IDX
+    read -rp "  Select snapshot [1]: " IDX || true
+    IDX="${IDX:-1}"
+    [[ "$IDX" =~ ^[0-9]+$ ]] || die "Invalid selection."
+    [ "$IDX" -ge 1 ] && [ "$IDX" -le "${#SNAPS[@]}" ] || die "Out of range."
+    local SNAP="${SNAPS[$((IDX-1))]}"
+
+    echo ""
+    echo "  Will restore from: $(basename "$SNAP")"
+    read -rp "  Confirm? [y/N] " yn || true
+    case "${yn,,}" in y|yes) ;; *) echo "Aborted."; return ;; esac
+
+    local MODE_NOW; MODE_NOW="$(host_mode)"
+
+    echo "  Stopping services..."
+    if [ "$MODE_NOW" = "legacy" ]; then
+        systemctl stop spoof-tunnel 2>/dev/null || true
+    else
+        local n
+        while IFS= read -r n; do
+            [ -n "$n" ] && systemctl stop "spoof-tunnel@${n}" 2>/dev/null || true
+        done < <(tunnel_names)
+    fi
+
+    if [ -f "${SNAP}/spoof-tunnel" ]; then
+        install -m 755 "${SNAP}/spoof-tunnel" "$BIN"
+        echo "  Binary restored."
+    fi
+
+    if [ -f "${SNAP}/config.yaml" ] || [ -d "${SNAP}/tunnels" ]; then
+        read -rp "  Restore configs too? [y/N] " yn2 || true
+        case "${yn2,,}" in
+            y|yes)
+                [ -f "${SNAP}/config.yaml" ] && cp -f "${SNAP}/config.yaml" "$LEGACY_YAML"
+                [ -f "${SNAP}/tunnel.env" ]  && cp -f "${SNAP}/tunnel.env"  "$LEGACY_ENV"
+                if [ -d "${SNAP}/tunnels" ]; then
+                    mkdir -p "$TUNNELS_DIR"
+                    cp -f "${SNAP}/tunnels"/* "$TUNNELS_DIR/" 2>/dev/null || true
+                fi
+                echo "  Config restored."
+                ;;
+        esac
+    fi
+    [ -f "${SNAP}/spoof-tunnel.service" ] && \
+        cp -f "${SNAP}/spoof-tunnel.service" "$LEGACY_UNIT_FILE"
+    [ -f "${SNAP}/spoof-tunnel@.service" ] && \
+        cp -f "${SNAP}/spoof-tunnel@.service" "$TEMPLATE_UNIT_FILE"
+    systemctl daemon-reload
+
+    echo "  Starting services..."
+    local bad=""
+    if [ "$(host_mode)" = "legacy" ]; then
+        systemctl start spoof-tunnel 2>/dev/null || true
+        sleep 2
+        systemctl is-active spoof-tunnel >/dev/null 2>&1 || bad="spoof-tunnel"
+    else
+        local m
+        while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            systemctl start "spoof-tunnel@${m}" 2>/dev/null || true
+            sleep 2
+            systemctl is-active "spoof-tunnel@${m}" >/dev/null 2>&1 || \
+                bad="${bad:+$bad }spoof-tunnel@${m}"
+        done < <(tunnel_names)
+    fi
+
+    if [ -z "$bad" ]; then
+        echo "  $(color_ok "Rollback complete. Services are running.")"
+    else
+        echo "  $(color_err "Failed to start after rollback: ${bad}")"
         exit 1
     fi
 }
@@ -1012,57 +1549,73 @@ cmd_uninstall() {
     need_root
 
     echo ""
-    echo "  $(color_warn "This will completely remove spoof-tunnel from this system.")"
+    echo "  $(color_warn "This will completely remove spoof-tunnel from this system,")"
+    echo "  $(color_warn "including every configured tunnel.")"
     echo ""
     read -rp "  Type 'yes' to confirm uninstall: " yn || true
     [ "$yn" = "yes" ] || { echo "Aborted."; return; }
 
     echo ""
-    echo "  Stopping and disabling service..."
-    systemctl stop    "${SERVICE}" 2>/dev/null || true
-    systemctl disable "${SERVICE}" 2>/dev/null || true
+    echo "  Stopping and disabling services..."
 
-    # Load the env before deleting it so the teardown knows the port and TUN name.
-    load_env
+    # Tear each tunnel down with its own env loaded, so its rules and TUN
+    # device are removed before the files disappear.
+    teardown_one() {
+        local unit="$1" env="$2" inst="$3"
+        systemctl stop    "$unit" 2>/dev/null || true
+        systemctl disable "$unit" 2>/dev/null || true
+        if [ -f "$env" ]; then
+            if [ -x "$FORWARD_HOOK" ]; then
+                "$FORWARD_HOOK" --remove $inst 2>/dev/null || true
+            fi
+            drop_input_rule "$(env_get "$env" LISTEN_PORT)"
+            del_tun_device  "$(env_get "$env" TUN_NAME)"
+        fi
+    }
+
+    local n
+    while IFS= read -r n; do
+        [ -z "$n" ] && continue
+        echo "  Removing tunnel '${n}'..."
+        teardown_one "spoof-tunnel@${n}" "${TUNNELS_DIR}/${n}.env" "$n"
+        remove_instance_dropin "$n"
+    done < <(tunnel_names)
+
+    if [ -f "$LEGACY_ENV" ] || [ -f "$LEGACY_UNIT_FILE" ]; then
+        echo "  Removing the single-tunnel install..."
+        teardown_one "spoof-tunnel" "$LEGACY_ENV" ""
+    fi
 
     if systemctl list-unit-files 2>/dev/null | grep -q '^spoof-tunnel-prom.timer'; then
         systemctl stop    spoof-tunnel-prom.timer 2>/dev/null || true
         systemctl disable spoof-tunnel-prom.timer 2>/dev/null || true
     fi
 
-    echo "  Removing iptables rules..."
-    if [ -f "${FORWARD_HOOK}" ] && [ -f "${ENV_FILE}" ]; then
-        "${FORWARD_HOOK}" --remove 2>/dev/null || true
-    fi
-    drop_input_rule "${LISTEN_PORT:-}"
-
-    del_tun_device "${TUN_NAME:-tun0}"
-
     echo "  Removing files..."
-    rm -f "/etc/systemd/system/${SERVICE}.service"
-    rm -f "/etc/systemd/system/${SERVICE}-prom.service"
-    rm -f "/etc/systemd/system/${SERVICE}-prom.timer"
-    rm -f "/usr/local/bin/spoof-tunnel"
-    rm -f "/usr/local/bin/spoofctl"
-    rm -f "/usr/local/libexec/spoof-tunnel-prepare"
-    rm -f "/usr/local/libexec/spoof-tunnel-qdisc"
-    rm -f "/usr/local/libexec/spoof-tunnel-forward"
-    rm -f "/etc/sysctl.d/99-spoof-tunnel.conf"
-    rm -f "/etc/cron.d/spoof-tunnel"
-    rm -f "/etc/logrotate.d/spoof-tunnel"
-    rm -rf "/usr/local/lib/spoof-tunnel"
+    rm -f "$LEGACY_UNIT_FILE" "${LEGACY_UNIT_FILE}.pre-migrate" \
+          "$TEMPLATE_UNIT_FILE" \
+          "${SYSTEMD_DIR}/spoof-tunnel-prom.service" \
+          "${SYSTEMD_DIR}/spoof-tunnel-prom.timer" \
+          /usr/local/bin/spoof-tunnel \
+          /usr/local/bin/spoof-tunnel.bak \
+          /usr/local/bin/spoofctl \
+          "$PREPARE_HOOK" "$QDISC_HOOK" "$FORWARD_HOOK" \
+          /etc/sysctl.d/99-spoof-tunnel.conf \
+          /etc/cron.d/spoof-tunnel \
+          /etc/logrotate.d/spoof-tunnel
+    rm -rf "$LIB_DIR" "$RUN_DIR"
 
     echo ""
-    read -rp "  Remove config (/etc/spoof-tunnel)? [y/N] " yn2 || true
+    read -rp "  Remove config (${CONF_DIR})? [y/N] " yn2 || true
     case "${yn2,,}" in
-        y|yes) rm -rf "/etc/spoof-tunnel"; echo "  Config removed." ;;
-        *) echo "  Config kept at /etc/spoof-tunnel" ;;
+        y|yes) rm -rf "$CONF_DIR"; echo "  Config removed." ;;
+        *) echo "  Config kept at ${CONF_DIR}" ;;
     esac
 
     echo ""
     read -rp "  Remove logs (/var/log/spoof-tunnel)? [y/N] " yn3 || true
     case "${yn3,,}" in
-        y|yes) rm -rf "/var/log/spoof-tunnel"; echo "  Logs removed." ;;
+        y|yes) rm -rf /var/log/spoof-tunnel; echo "  Logs removed." ;;
         *) echo "  Logs kept at /var/log/spoof-tunnel" ;;
     esac
 
@@ -1074,20 +1627,54 @@ cmd_uninstall() {
 
 # ── interactive menu ─────────────────────────────────────────────────────────
 
-show_menu() {
-    local state
-    state=$(svc_state)
-    local state_str
-    if [ "$state" = "active" ]; then
-        state_str="$(color_ok "$state")"
-    else
-        state_str="$(color_err "$state")"
-    fi
+# Which tunnel the menu is currently pointed at. Empty means "ask each time",
+# which is what a single-tunnel host wants.
+MENU_TUNNEL=""
 
+menu_header() {
+    local mode; mode="$(host_mode)"
     echo ""
     hr
-    printf "  spoofctl — service: %s\n" "$state_str"
+    case "$mode" in
+        legacy)
+            printf "  spoofctl — single tunnel: %s\n" \
+                "$( [ "$(svc_state spoof-tunnel)" = "active" ] \
+                    && color_ok active || color_err "$(svc_state spoof-tunnel)" )"
+            ;;
+        multi)
+            local count; count="$(tunnel_count)"
+            if [ -n "$MENU_TUNNEL" ]; then
+                printf "  spoofctl — tunnel '%s': %s   (%s configured)\n" \
+                    "$MENU_TUNNEL" \
+                    "$( [ "$(svc_state "spoof-tunnel@${MENU_TUNNEL}")" = "active" ] \
+                        && color_ok active || color_err "$(svc_state "spoof-tunnel@${MENU_TUNNEL}")" )" \
+                    "$count"
+            else
+                printf "  spoofctl — %s tunnel(s) configured\n" "$count"
+            fi
+            ;;
+        empty)
+            printf "  spoofctl — no tunnel configured\n"
+            ;;
+    esac
     hr
+}
+
+menu_switch_tunnel() {
+    if [ "$(host_mode)" != "multi" ]; then
+        echo "  This host has a single tunnel — nothing to switch between."
+        return
+    fi
+    if [ "$(tunnel_count)" -eq 0 ]; then
+        echo "  No tunnels configured. Create one first."
+        return
+    fi
+    MENU_TUNNEL="$(tun_pick)"
+    echo "  Selected tunnel: ${MENU_TUNNEL}"
+}
+
+show_menu() {
+    menu_header
     echo "  1) Status"
     echo "  2) Start"
     echo "  3) Stop"
@@ -1095,35 +1682,47 @@ show_menu() {
     echo "  5) Edit Config"
     echo "  6) Change Spoof IPs"
     echo "  7) Port Forwarding..."
-    echo "  8) Create Tunnel"
-    echo "  9) Delete Tunnel"
-    echo " 10) Update"
-    echo " 11) Rollback"
-    echo " 12) Uninstall"
-    echo " 13) Exit"
+    echo "  8) List Tunnels"
+    echo "  9) Switch Tunnel"
+    echo " 10) Create Tunnel"
+    echo " 11) Delete Tunnel"
+    echo " 12) Migrate to multi-tunnel layout"
+    echo " 13) Update"
+    echo " 14) Rollback"
+    echo " 15) Uninstall"
+    echo " 16) Exit"
     hr
     echo ""
 }
 
 interactive_menu() {
+    local CHOICE
     while true; do
         show_menu
-        read -rp "  Choice [1-13]: " CHOICE || true
+        read -rp "  Choice [1-16]: " CHOICE || true
         echo ""
+        # A refusal or a validation failure must not kill the menu.
         case "$CHOICE" in
-            1)  cmd_status ;;
-            2)  cmd_start ;;
-            3)  cmd_stop ;;
-            4)  cmd_restart ;;
-            5)  cmd_edit_config ;;
-            6)  cmd_spoof_ips ;;
+            1)  cmd_status   "$MENU_TUNNEL" || true ;;
+            2)  cmd_start    "$MENU_TUNNEL" || true ;;
+            3)  cmd_stop     "$MENU_TUNNEL" || true ;;
+            4)  cmd_restart  "$MENU_TUNNEL" || true ;;
+            5)  cmd_edit_config "$MENU_TUNNEL" || true ;;
+            6)  cmd_spoof_ips   "$MENU_TUNNEL" || true ;;
             7)  menu_forward ;;
-            8)  cmd_create || true ;;   # a refusal must not kill the menu
-            9)  cmd_delete ;;
-            10) cmd_update ;;
-            11) cmd_rollback ;;
-            12) cmd_uninstall; break ;;
-            13|q|quit|exit) echo "  Bye."; break ;;
+            8)  cmd_list || true ;;
+            9)  menu_switch_tunnel || true ;;
+            10) cmd_create "" || true ;;
+            11) cmd_delete "$MENU_TUNNEL" || true
+                # The selected tunnel may have just been deleted.
+                [ -n "$MENU_TUNNEL" ] && \
+                    [ ! -f "${TUNNELS_DIR}/${MENU_TUNNEL}.yaml" ] && MENU_TUNNEL=""
+                ;;
+            12) cmd_migrate "" || true ;;
+            13) cmd_update || true ;;
+            14) cmd_rollback || true ;;
+            15) cmd_uninstall; break ;;
+            16|q|quit|exit) echo "  Bye."; break ;;
             *)  echo "  Invalid choice." ;;
         esac
         echo ""
@@ -1133,47 +1732,77 @@ interactive_menu() {
 
 # ── entry point ──────────────────────────────────────────────────────────────
 
+# Pull "-t NAME" / "--tunnel NAME" out of the argument list wherever it appears,
+# so it works with every command including the forward subcommands.
+OPT_TUNNEL=""
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t|--tunnel) OPT_TUNNEL="${2:-}"; shift 2 ;;
+        *)           ARGS+=("$1"); shift ;;
+    esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
 CMD="${1:-}"
 shift || true
 
+# Commands that name their tunnel positionally fall back to -t.
+POS_TUNNEL="${1:-$OPT_TUNNEL}"
+
 case "$CMD" in
     "")              interactive_menu ;;
-    status)          cmd_status ;;
-    start)           cmd_start ;;
-    stop)            cmd_stop ;;
-    restart)         cmd_restart ;;
-    edit-config)     cmd_edit_config ;;
-    spoof-ips)       cmd_spoof_ips ;;
+    list|ls)         cmd_list ;;
+    status)          cmd_status      "$POS_TUNNEL" ;;
+    start)           cmd_start       "$POS_TUNNEL" ;;
+    stop)            cmd_stop        "$POS_TUNNEL" ;;
+    restart)         cmd_restart     "$POS_TUNNEL" ;;
+    edit-config)     cmd_edit_config "$POS_TUNNEL" ;;
+    spoof-ips)       cmd_spoof_ips   "$POS_TUNNEL" ;;
     forward)         cmd_forward "$@" ;;
     forward-rules)   cmd_forward replace "${1:-}" ;;
-    create)          cmd_create ;;
-    delete)          cmd_delete ;;
+    create)          cmd_create      "$POS_TUNNEL" ;;
+    delete)          cmd_delete      "$POS_TUNNEL" ;;
+    migrate)         cmd_migrate     "${1:-}" ;;
     update)          cmd_update ;;
     rollback)        cmd_rollback ;;
     uninstall)       cmd_uninstall ;;
     -h|--help|help)
-        echo "Usage: spoofctl [command]"
-        echo "Commands:"
-        echo "  status          Show tunnel status, metrics, and forwarding rules"
-        echo "  start           Start the service"
-        echo "  stop            Stop the service"
-        echo "  restart         Restart the service"
-        echo "  edit-config     Open config.yaml in \$EDITOR"
-        echo "  spoof-ips       Update the spoof IP list"
-        echo "  create          Set up a new tunnel with the setup wizard"
-        echo "  delete          Remove the configured tunnel (keeps the tooling)"
-        echo "  update          Download and install the latest release"
-        echo "  rollback        Restore a previous snapshot"
-        echo "  uninstall       Remove spoof-tunnel from this system"
-        echo ""
-        echo "Port forwarding (client nodes only):"
-        echo "  forward list            Show configured ports and live iptables rules"
-        echo "  forward add PORT[,...]  Add port(s), keeping the existing ones"
-        echo "  forward del PORT[,...]  Remove port(s); 'all' removes every rule"
-        echo "  forward replace LIST    Replace the whole list (alias: forward-rules)"
-        echo "  forward apply           Re-install the rules for the configured list"
-        echo ""
-        echo "With no command, shows the interactive menu."
+        cat << 'HELPEOF'
+Usage: spoofctl [command] [tunnel]
+
+A host can run several tunnels. Commands that act on one take its name, either
+positionally or as -t NAME. With one tunnel configured the name is optional;
+with several, omitting it opens a numbered picker.
+
+Tunnels:
+  list                    Show every configured tunnel, numbered
+  create [NAME]           Set up a new tunnel with the setup wizard
+  delete [NAME]           Remove one tunnel (keeps the tooling and the others)
+  migrate [NAME]          Convert a pre-multi-tunnel host to the named layout
+
+Per tunnel:
+  status [NAME]           Service state, metrics and forwarding rules
+  start [NAME]            Start the service
+  stop [NAME]             Stop the service
+  restart [NAME]          Restart the service
+  edit-config [NAME]      Open the tunnel's config.yaml in $EDITOR
+  spoof-ips [NAME]        Update its spoof IP list
+
+Port forwarding (client nodes only; use -t NAME to pick the tunnel):
+  forward list            Configured ports and live iptables rules
+  forward add PORT[,...]  Add port(s), keeping the existing ones
+  forward del PORT[,...]  Remove port(s); 'all' removes every rule
+  forward replace LIST    Replace the whole list (alias: forward-rules)
+  forward apply           Re-install the rules for the configured list
+
+Host:
+  update                  Download and install the latest release
+  rollback                Restore a previous snapshot
+  uninstall               Remove spoof-tunnel and every tunnel
+
+With no command, shows the interactive menu.
+HELPEOF
         ;;
     *)
         echo "Unknown command: $CMD" >&2

@@ -3,7 +3,8 @@
 ## Quick Diagnostics
 
 ```bash
-spoofctl status                        # service state + metrics
+spoofctl list                          # every tunnel on this host
+spoofctl status [NAME]                 # service state + metrics
 journalctl -u spoof-tunnel -n 50       # recent logs
 cat /run/spoof-tunnel/health.json      # JSON metrics
 ping <peer-tun-ip>                     # test tunnel IP reachability
@@ -302,6 +303,27 @@ spoofctl status         # forwarded ports and live DNAT/MASQUERADE/FORWARD count
 `forward list` marks a port `configured, rule missing` when it is in
 `FORWARD_PORTS` but its DNAT rule is not in iptables — the usual symptom of
 another tool flushing the nat table. `spoofctl forward apply` puts them back.
+
+On a host with several tunnels, add `-t NAME` to every command above; each
+tunnel's rules are reported and repaired separately.
+
+**A second tunnel will not start.** Check for a resource it shares with an
+existing one — `config-parse.py` names the conflict:
+
+```bash
+spoofctl list                     # what the other tunnels already own
+journalctl -u spoof-tunnel@NAME -n 30
+```
+
+`tun_name`, `listen_port`, the TUN IP pair and every forwarded port must be
+unique across the host. `spoofctl edit-config NAME` then `spoofctl restart
+NAME` after fixing it.
+
+**Queue figures look identical for two tunnels.** They will, if the tunnels
+share a physical interface: `fq` is per NIC, so
+`/var/log/spoof-tunnel/qdisc-<iface>.log` describes the interface, not one
+tunnel. The applied `flow_limit` is the highest among the tunnels on that
+interface.
 
 ---
 

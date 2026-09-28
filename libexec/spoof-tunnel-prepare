@@ -10,11 +10,19 @@
 #   3. Enables ip_forward for TUN routing between the tunnel and the overlay
 #      service (Xray, VLESS, etc.).
 #
-# Environment is loaded from /etc/spoof-tunnel/tunnel.env (written by
-# config-parse.py during install).
+# Usage: spoof-tunnel-prepare [instance]
+#
+# The instance name is passed as %i by spoof-tunnel@.service. With no argument
+# the flat legacy env file is used, so a pre-multi-tunnel install keeps working.
 set -euo pipefail
 
-source /etc/spoof-tunnel/tunnel.env
+INSTANCE="${1:-}"
+if [ -n "${INSTANCE}" ]; then
+    ENV_FILE="/etc/spoof-tunnel/tunnels/${INSTANCE}.env"
+else
+    ENV_FILE="/etc/spoof-tunnel/tunnel.env"
+fi
+source "${ENV_FILE}"
 
 # rp_filter must be 0 for spoofed source IPs to survive the kernel's ingress
 # check. Without this, inbound spoofed packets are silently dropped before

@@ -1,7 +1,18 @@
 #!/bin/bash
 # spoof-tunnel-v6 install.sh
 # Idempotent. Safe to re-run on an already-installed system.
-# Usage: sudo ./install.sh [--config-only] [--no-start]
+#
+# Usage: sudo ./install.sh [--config-only] [--no-start] [--tooling-only]
+#
+#   --tooling-only  Install the binary, hooks, scripts and the
+#                   spoof-tunnel@.service template, and nothing else. No
+#                   config.yaml is read and no service is touched. This is
+#                   what an upgrade runs on a host that already has its
+#                   tunnels under /etc/spoof-tunnel/tunnels/.
+#
+# Without --tooling-only the script also installs a single tunnel from
+# ./config.yaml onto the plain spoof-tunnel.service unit — the original
+# layout, still used by hosts that have not run 'spoofctl migrate'.
 set -euo pipefail
 
 PACKAGE_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -18,12 +29,17 @@ LOGROTATE_FILE="/etc/logrotate.d/spoof-tunnel"
 
 CONFIG_ONLY=0
 NO_START=0
+TOOLING_ONLY=0
 for arg in "$@"; do
     case "$arg" in
-        --config-only) CONFIG_ONLY=1 ;;
-        --no-start)    NO_START=1 ;;
+        --config-only)  CONFIG_ONLY=1 ;;
+        --no-start)     NO_START=1 ;;
+        --tooling-only) TOOLING_ONLY=1 ;;
     esac
 done
+
+TUNNELS_DIR="/etc/spoof-tunnel/tunnels"
+TEMPLATE_UNIT_FILE="/etc/systemd/system/spoof-tunnel@.service"
 
 # ── pre-flight ──────────────────────────────────────────────────────────────
 
@@ -54,15 +70,17 @@ if [ ! -e /dev/net/tun ]; then
     fi
 fi
 
-if [ ! -f "${CONFIG_YAML}" ]; then
-    echo "ERROR: config.yaml not found at ${CONFIG_YAML}" >&2
-    echo "       Copy config.yaml.example to config.yaml and edit it." >&2
-    exit 1
-fi
+if [ "${TOOLING_ONLY}" = "0" ]; then
+    if [ ! -f "${CONFIG_YAML}" ]; then
+        echo "ERROR: config.yaml not found at ${CONFIG_YAML}" >&2
+        echo "       Copy config.yaml.example to config.yaml and edit it." >&2
+        exit 1
+    fi
 
-# Validate config before doing anything
-python3 "${PACKAGE_DIR}/scripts/config-parse.py" --validate "${CONFIG_YAML}" 2>&1 \
-    || { echo "ERROR: config.yaml validation failed" >&2; exit 1; }
+    # Validate config before doing anything
+    python3 "${PACKAGE_DIR}/scripts/config-parse.py" --validate "${CONFIG_YAML}" 2>&1 \
+        || { echo "ERROR: config.yaml validation failed" >&2; exit 1; }
+fi
 
 # ── directory setup ─────────────────────────────────────────────────────────
 
@@ -80,17 +98,21 @@ log() { echo "$*"; echo "$(date -u +%T) $*" >> "${INSTALL_LOG}"; }
 
 # ── parse config ────────────────────────────────────────────────────────────
 
-log "Parsing config.yaml..."
-python3 "${PACKAGE_DIR}/scripts/config-parse.py" \
-    --output "${ENV_FILE}" "${CONFIG_YAML}" 2>&1 | tee -a "${INSTALL_LOG}"
-chmod 640 "${ENV_FILE}"
+if [ "${TOOLING_ONLY}" = "0" ]; then
+    log "Parsing config.yaml..."
+    python3 "${PACKAGE_DIR}/scripts/config-parse.py" \
+        --output "${ENV_FILE}" "${CONFIG_YAML}" 2>&1 | tee -a "${INSTALL_LOG}"
+    chmod 640 "${ENV_FILE}"
 
-# Source the generated env file
-set -a; source "${ENV_FILE}"; set +a
+    # Source the generated env file
+    set -a; source "${ENV_FILE}"; set +a
 
-if [ "${CONFIG_ONLY}" = "1" ]; then
-    log "Config-only mode: regenerated ${ENV_FILE}"
-    exit 0
+    if [ "${CONFIG_ONLY}" = "1" ]; then
+        log "Config-only mode: regenerated ${ENV_FILE}"
+        exit 0
+    fi
+else
+    log "Tooling-only mode: not touching any tunnel config."
 fi
 
 # ── verify full-install prerequisites ────────────────────────────────────────
@@ -173,21 +195,78 @@ install -m 750 -o root -g root \
     "${PACKAGE_DIR}/libexec/spoof-tunnel-forward" \
     "${LIBEXEC_DIR}/spoof-tunnel-forward"
 
-# ── systemd service unit ─────────────────────────────────────────────────────
+# ── systemd units ────────────────────────────────────────────────────────────
+#
+# Two units are written:
+#
+#   spoof-tunnel@.service   the template every named tunnel runs on. Because
+#                           one file serves every instance it cannot bake in
+#                           per-tunnel ExecStart flags, so it expands
+#                           $EXTRA_ARGS (unbraced, so systemd splits it into
+#                           words) from the instance's env file. WatchdogSec
+#                           cannot be an environment expansion at all, so each
+#                           instance carries it in a drop-in written by
+#                           spoofctl.
+#
+#   spoof-tunnel.service    the original single-tunnel unit, written only when
+#                           this run is installing a config.yaml. A host that
+#                           has migrated never gets it back.
+#
+# KEEP IN SYNC with write_template_unit() in scripts/spoofctl — the two must
+# produce byte-identical files.
 
-log "Writing service unit..."
+log "Writing systemd template unit..."
+cat > "${TEMPLATE_UNIT_FILE}" << EOF
+[Unit]
+Description=spoof-tunnel-v6 IP tunnel (%i)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+EnvironmentFile=${TUNNELS_DIR}/%i.env
+ExecStartPre=${LIBEXEC_DIR}/spoof-tunnel-prepare %i
+ExecStart=${BIN_DST} \\
+    --name %i \\
+    --mode \${MODE} \\
+    --outer \${OUTER} \\
+    --iface \${IFACE} \\
+    --tun \${TUN_NAME} \\
+    --peer-ip \${PEER_IP} \\
+    --local-tun \${LOCAL_TUN} \\
+    --peer-tun \${PEER_TUN} \\
+    --listen-port \${LISTEN_PORT} \\
+    --peer-port \${PEER_PORT} \\
+    --mtu \${MTU} \\
+    --tx-cpu \${TX_CPU} \\
+    --rx-cpu \${RX_CPU} \\
+    --rate-mbps \${RATE_MBPS} \\
+    --flow-limit \${FLOW_LIMIT} \\
+    --batch-size \${BATCH_SIZE} \\
+    --rx-block-nr \${RX_BLOCK_NR} \\
+    --failover-loss \${FAILOVER_LOSS} \\
+    --failover-intervals \${FAILOVER_INTERVALS} \\
+    --metric-interval \${METRIC_INTERVAL} \\
+    --watchdog-sec \${WATCHDOG_SEC} \$EXTRA_ARGS
+ExecStartPost=${LIBEXEC_DIR}/spoof-tunnel-qdisc %i
+ExecStartPost=${LIBEXEC_DIR}/spoof-tunnel-forward %i
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+if [ "${TOOLING_ONLY}" = "0" ]; then
+log "Writing single-tunnel service unit..."
 WATCHDOG_LINE=""
 [ "${WATCHDOG_SEC:-0}" -gt 0 ] && WATCHDOG_LINE="WatchdogSec=${WATCHDOG_SEC}"
-
-# Build optional ExecStart flags at install time.
-# KEEP IN SYNC with regen_unit() in scripts/spoofctl, which rewrites this
-# same unit when 'spoofctl create' sets up a tunnel on an installed host.
-# These values come from tunnel.env (already sourced above).
-# EXEC_SPOOF and EXEC_JSON contain literal ${...} text for systemd runtime expansion.
-EXEC_SPOOF=''
-[ -n "${SPOOF_IPS:-}" ] && EXEC_SPOOF=' --spoof-ips ${SPOOF_IPS}'
-EXEC_JSON=''
-[ "${JSON_METRICS:-false}" = "true" ] && EXEC_JSON=' --json-metrics'
 
 cat > "${SERVICE_FILE}" << EOF
 [Unit]
@@ -219,7 +298,7 @@ ExecStart=${BIN_DST} \\
     --failover-loss \${FAILOVER_LOSS} \\
     --failover-intervals \${FAILOVER_INTERVALS} \\
     --metric-interval \${METRIC_INTERVAL} \\
-    --watchdog-sec \${WATCHDOG_SEC}${EXEC_SPOOF}${EXEC_JSON}
+    --watchdog-sec \${WATCHDOG_SEC} \$EXTRA_ARGS
 ExecStartPost=${LIBEXEC_DIR}/spoof-tunnel-qdisc
 ExecStartPost=${LIBEXEC_DIR}/spoof-tunnel-forward
 Restart=always
@@ -235,10 +314,14 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 # ── sysctl tuning ────────────────────────────────────────────────────────────
 
-if [ "${SYSCTL_TUNE:-true}" = "true" ]; then
+# Host-wide kernel tuning: shared by every tunnel, applied once. Skipped in
+# tooling-only mode only because there is no config to read the flag from —
+# the file already on disk stays in force.
+if [ "${TOOLING_ONLY}" = "0" ] && [ "${SYSCTL_TUNE:-true}" = "true" ]; then
     log "Applying sysctl tuning..."
     cat > "${SYSCTL_FILE}" << EOF
 # spoof-tunnel kernel tuning
@@ -258,14 +341,17 @@ fi
 # ── qdisc monitoring cron ────────────────────────────────────────────────────
 
 log "Installing qdisc monitor cron (every minute)..."
+# The monitor scrapes every interface in use and writes
+# /var/log/spoof-tunnel/qdisc-<iface>.log itself, so nothing is redirected
+# here any more.
 cat > "${CRON_FILE}" << EOF
-# spoof-tunnel qdisc monitor — runs every minute
-* * * * * root ${LIB_DIR}/qdisc-monitor.sh >> /var/log/spoof-tunnel/qdisc.log 2>&1
+# spoof-tunnel qdisc monitor — runs every minute, one log per interface
+* * * * * root ${LIB_DIR}/qdisc-monitor.sh >/dev/null 2>&1
 EOF
 
 # ── Prometheus export ────────────────────────────────────────────────────────
 
-if [ "${PROM_ENABLED:-false}" = "true" ]; then
+if [ "${TOOLING_ONLY}" = "0" ] && [ "${PROM_ENABLED:-false}" = "true" ]; then
     log "Installing Prometheus export timer..."
     cat > /etc/systemd/system/spoof-tunnel-prom.service << EOF
 [Unit]
@@ -295,8 +381,12 @@ fi
 # ── log rotation ─────────────────────────────────────────────────────────────
 
 RETAIN="${LOG_RETENTION_DAYS:-30}"
+# Globs, so a tunnel added later is covered without touching this file:
+#   qdisc-<iface>.log   one per physical interface
+#   <instance>/metrics.jsonl  one per tunnel
+# The bare qdisc.log and metrics.jsonl are the pre-migration names.
 cat > "${LOGROTATE_FILE}" << EOF
-/var/log/spoof-tunnel/qdisc.log {
+/var/log/spoof-tunnel/qdisc.log /var/log/spoof-tunnel/qdisc-*.log {
     daily
     rotate ${RETAIN}
     compress
@@ -304,7 +394,7 @@ cat > "${LOGROTATE_FILE}" << EOF
     notifempty
     copytruncate
 }
-/var/log/spoof-tunnel/metrics.jsonl {
+/var/log/spoof-tunnel/metrics.jsonl /var/log/spoof-tunnel/*/metrics.jsonl {
     daily
     rotate ${RETAIN}
     compress
@@ -334,6 +424,16 @@ EOF
 
 log "Reloading systemd..."
 systemctl daemon-reload
+
+if [ "${TOOLING_ONLY}" = "1" ]; then
+    log "Tooling installed. Existing tunnels are untouched."
+    echo ""
+    echo "  Binary:   ${BIN_DST}"
+    echo "  Template: ${TEMPLATE_UNIT_FILE}"
+    echo "  Manage:   spoofctl"
+    exit 0
+fi
+
 systemctl enable spoof-tunnel
 
 if [ "${NO_START}" = "0" ]; then

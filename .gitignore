@@ -23,3 +23,7 @@ GITHUB_AUDIT.md
 GITHUB_AUDIT_V2.md
 PUBLISH_READINESS.md
 PUBLISH_READINESS_V2.md
+
+# Python bytecode
+__pycache__/
+*.pyc

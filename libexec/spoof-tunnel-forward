@@ -2,10 +2,19 @@
 # spoof-tunnel-forward — install / remove iptables port-forwarding rules
 #
 # Usage:
-#   spoof-tunnel-forward                   install rules  (ExecStartPost)
-#   spoof-tunnel-forward --remove          remove every rule (uninstall/delete)
-#   spoof-tunnel-forward --remove-port N   remove only the DNAT rules for port N
-#                                          (used by 'spoofctl forward del N')
+#   spoof-tunnel-forward [inst]                   install rules (ExecStartPost)
+#   spoof-tunnel-forward --remove [inst]          remove every rule of this
+#                                                 tunnel (uninstall/delete)
+#   spoof-tunnel-forward --remove-port N [inst]   remove only the DNAT rules
+#                                                 for port N ('forward del N')
+#
+# [inst] is the instance name, passed as %i by spoof-tunnel@.service. Omitted
+# on a pre-multi-tunnel install, which still uses the flat env file.
+#
+# Rules belonging to different tunnels never overlap: config-parse.py rejects
+# a config that reuses another instance's tun_name, listen_port or forwarded
+# port, so the DNAT rules (keyed by port) and the FORWARD/MASQUERADE rules
+# (keyed by TUN device) are disjoint by construction.
 #
 # ── What this script does ────────────────────────────────────────────────────
 #
@@ -47,9 +56,24 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-ACTION="${1:-install}"
-ARG_PORT="${2:-}"
-source /etc/spoof-tunnel/tunnel.env
+ACTION="install"
+ARG_PORT=""
+INSTANCE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --remove)      ACTION="--remove"; shift ;;
+        --remove-port) ACTION="--remove-port"; ARG_PORT="${2:-}"; shift 2 ;;
+        --*)           echo "spoof-tunnel-forward: unknown option $1" >&2; exit 1 ;;
+        *)             INSTANCE="$1"; shift ;;
+    esac
+done
+
+if [ -n "${INSTANCE}" ]; then
+    ENV_FILE="/etc/spoof-tunnel/tunnels/${INSTANCE}.env"
+else
+    ENV_FILE="/etc/spoof-tunnel/tunnel.env"
+fi
+source "${ENV_FILE}"
 
 [ "${MODE:-}" = "client" ] || exit 0
 

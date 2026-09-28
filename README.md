@@ -220,15 +220,88 @@ spoofctl [command]
 | `stop` | Stop the service |
 | `restart` | Restart the service |
 | `edit-config` | Open `config.yaml` in `$EDITOR` and optionally restart |
+| `list` | Show every configured tunnel, numbered |
 | `spoof-ips` | Update the spoof IP list and restart |
 | `forward list\|add\|del\|replace\|apply` | Manage forwarded ports (client only) |
-| `create` | Set up a new tunnel with the wizard (after `delete`) |
-| `delete` | Remove the configured tunnel, keeping the tooling installed |
+| `create [NAME]` | Set up a new tunnel with the wizard |
+| `delete [NAME]` | Remove one tunnel, keeping the tooling and the others |
+| `migrate [NAME]` | Convert a single-tunnel host to the named layout |
 | `update` | Download and install the latest release (auto-rollback on failure) |
 | `rollback` | Restore a previous snapshot |
 | `uninstall` | Remove everything from this system |
 
 `forward-rules` is kept as an alias for `forward replace`.
+
+## Multiple tunnels on one host
+
+One host can terminate several tunnels at once — an Iran box linked to several
+different foreign servers over the same NIC. Each tunnel is a named instance
+with its own config, systemd unit, TUN device and forwarding rules:
+
+| | |
+|---|---|
+| config | `/etc/spoof-tunnel/tunnels/<name>.yaml` |
+| env | `/etc/spoof-tunnel/tunnels/<name>.env` |
+| unit | `spoof-tunnel@<name>.service` |
+| runtime | `/run/spoof-tunnel/<name>/health.json` |
+| metrics | `/var/log/spoof-tunnel/<name>/metrics.jsonl` |
+
+```bash
+spoofctl create de1            # add a tunnel
+spoofctl list                  # numbered table of all of them
+spoofctl status de1            # or: spoofctl status -t de1
+spoofctl forward add 8443 -t de1
+spoofctl delete de1            # only de1; the others keep running
+```
+
+Commands that act on one tunnel take its name positionally or as `-t NAME`.
+With a single tunnel configured the name is optional. With several, leaving it
+out opens a numbered picker:
+
+```
+  Which tunnel?
+   #  NAME         ROLE    PEER                     TUN     SERVICE  FORWARDED
+   1  de1          client  198.51.100.7:2081        tun1    active   8443
+   2  main         client  203.0.113.9:2080         tun0    active   443,80
+  Choice [1-2]:
+```
+
+### What each tunnel must not share
+
+The installer rejects a config that reuses another tunnel's `tun_name`,
+`listen_port`, TUN IP pair, or a forwarded port. That guarantee is what keeps
+the tunnels independent: DNAT rules are keyed by port and FORWARD/MASQUERADE
+rules by TUN device, so deleting one tunnel cannot disturb another. The wizard
+offers free values by default, so you can accept every default and get a config
+that installs.
+
+### The one thing they do share
+
+`fq` is a property of the physical NIC, not of a tunnel. When several tunnels
+run over the same interface, the qdisc hook applies the **highest**
+`flow_limit` among them rather than whichever tunnel started last, so the
+result does not depend on start order. `spoofctl status` labels the queue
+figures accordingly, and the qdisc log is per interface
+(`/var/log/spoof-tunnel/qdisc-<iface>.log`), not per tunnel.
+
+### Migrating an existing single-tunnel host
+
+Hosts installed before multi-tunnel support keep working untouched —
+`spoofctl update` does not convert them, and the tunnel stays on the plain
+`spoof-tunnel.service`. Convert it when you choose:
+
+```bash
+spoofctl migrate        # names it 'main' by default
+```
+
+`migrate` snapshots the config, env and unit first, then switches to
+`spoof-tunnel@<name>`. The tunnel restarts once. If it does not come back up,
+everything is restored and the original unit is started again, so a failed
+migration leaves the tunnel running. The old unit is kept as
+`spoof-tunnel.service.pre-migrate`.
+
+`spoofctl create` refuses to run on an unmigrated host and points here, so the
+two layouts never coexist.
 
 ### Deleting a tunnel
 

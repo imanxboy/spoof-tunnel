@@ -1,5 +1,7 @@
 #!/bin/bash
-# spoof-tunnel-qdisc — ExecStartPost hook for spoof-tunnel.service
+# spoof-tunnel-qdisc — ExecStartPost hook for spoof-tunnel@.service
+#
+# Usage: spoof-tunnel-qdisc [instance]
 #
 # Installs an fq (Fair Queue) qdisc on the outer physical interface after the
 # tunnel process signals ready. fq provides per-flow pacing which reduces burst
@@ -7,16 +9,60 @@
 # transmit queue. Only runs in UDP mode (TCP outer uses the kernel stack's own
 # congestion control).
 #
+# ── Shared interface ─────────────────────────────────────────────────────────
+#
+# The fq qdisc is a property of the physical NIC, not of a tunnel. When several
+# tunnels run over the same interface, each one's start would otherwise call
+# "tc qdisc replace" with its own flow_limit and the surviving value would
+# depend on start order.
+#
+# So instead of applying this instance's FLOW_LIMIT, we apply the MAXIMUM
+# FLOW_LIMIT across every configured tunnel that shares this interface. fq's
+# flow_limit caps the packets a single flow may hold in the queue; sizing it
+# for the most demanding tunnel is correct for all of them, and taking the max
+# makes the result identical no matter which tunnel starts last.
+#
 # The retry loop is needed because the TUN interface assignment (which triggers
 # the NIC to be eligible for fq) may complete slightly after sd_notify fires.
 set -euo pipefail
 
-source /etc/spoof-tunnel/tunnel.env
+INSTANCE="${1:-}"
+TUNNELS_DIR="/etc/spoof-tunnel/tunnels"
+LEGACY_ENV="/etc/spoof-tunnel/tunnel.env"
+
+if [ -n "${INSTANCE}" ]; then
+    ENV_FILE="${TUNNELS_DIR}/${INSTANCE}.env"
+else
+    ENV_FILE="${LEGACY_ENV}"
+fi
+source "${ENV_FILE}"
 
 [ "${OUTER:-udp}" = "udp" ] || exit 0
 
 LIMIT=50000
+
+# ── resolve flow_limit across every tunnel on this interface ────────────────
+
+# Read one variable out of an env file without polluting our own environment.
+env_get() {
+    local file="$1" key="$2"
+    [ -f "$file" ] || return 0
+    sed -n "s/^${key}=//p" "$file" | tail -1
+}
+
 FL="${FLOW_LIMIT:-1000}"
+
+for _env in "${TUNNELS_DIR}"/*.env "${LEGACY_ENV}"; do
+    [ -f "${_env}" ] || continue
+    [ "${_env}" = "${ENV_FILE}" ] && continue
+    _iface="$(env_get "${_env}" IFACE)"
+    [ "${_iface}" = "${IFACE}" ] || continue
+    _outer="$(env_get "${_env}" OUTER)"
+    [ "${_outer:-udp}" = "udp" ] || continue
+    _fl="$(env_get "${_env}" FLOW_LIMIT)"
+    [[ "${_fl}" =~ ^[0-9]+$ ]] || continue
+    [ "${_fl}" -gt "${FL}" ] && FL="${_fl}"
+done
 
 for _i in 1 2 3 4 5; do
     if tc qdisc replace dev "${IFACE}" root fq \

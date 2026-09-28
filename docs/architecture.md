@@ -110,8 +110,25 @@ Written in C. Two threads per process:
 - Writes inner packets to `tun_fd`.
 
 **Metric thread**:
-- Writes `/run/spoof-tunnel/health.json` every `metric_interval` seconds.
+- Writes `health.json` every `metric_interval` seconds — under
+  `/run/spoof-tunnel/<instance>/` when the process was started with `--name`
+  (how `spoof-tunnel@.service` runs it), otherwise `/run/spoof-tunnel/`.
 - Sends `sd_notify(WATCHDOG=1)` to systemd.
+
+### Instances
+
+One host can run several tunnels at once. `--name <instance>` is the only
+thing the binary itself knows about this: it namespaces `health.json` and
+`metrics.jsonl` so two processes do not overwrite each other's runtime state.
+Everything else that has to stay distinct — the TUN device, the listen port,
+the TUN IP pair, the forwarded ports — is ordinary configuration, kept unique
+by `config-parse.py`, which rejects a config that collides with another
+instance on the same host.
+
+The `fq` qdisc is the one genuinely shared resource, because it belongs to the
+physical interface rather than to a tunnel. `spoof-tunnel-qdisc` therefore
+applies the highest `flow_limit` among the instances using that interface, so
+the result does not depend on which tunnel started last.
 
 ### TUN device (`tun0`)
 
